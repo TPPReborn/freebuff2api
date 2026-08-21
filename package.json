@@ -5,6 +5,7 @@
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
+    "login": "node tools/login_cli.js",
     "test": "node -e 'console.log(\"OK\")'"
   },
   "keywords": [

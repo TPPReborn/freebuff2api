@@ -191,9 +191,32 @@ curl http://localhost:8787/v1/accounts \
 
 ---
 
-## 5. Cara Panen Akun & Token (Harvesting)
+## 5. Cara Login & Panen Akun (Token Harvesting)
 
-Freebuff2API menyertakan script harvester otomatis berbasis **Playwright** untuk login Google (Gmail & Google Workspace), melewati Terms of Service & Consent, lalu mengambil token secara otomatis.
+Freebuff2API menyediakan **2 Cara Login / Ambil Token**:
+
+### Cara A: Login Ringan di Termux / Native (Tanpa Playwright / Zero Dependencies)
+
+Sangat cocok untuk pengguna **Termux Android** atau VPS tanpa browser GUI:
+
+```bash
+# Menggunakan Node.js langsung (Bawaan repo):
+npm run login
+
+# Atau menggunakan Python:
+python3 tools/login_cli.py
+```
+
+**Alur Kerja:**
+1. Script menampilkan link login dan otomatis membuka browser di HP Anda (via `termux-open-url`).
+2. Anda cukup klik **Continue with Google** dan login seperti biasa di Chrome HP.
+3. Begitu selesai di browser, script di Termux langsung menangkap `authToken` dan menyimpannya ke `credentials/<email>.json`.
+
+---
+
+### Cara B: Automated Playwright Harvester (Multi-Akun Batch)
+
+Cocok untuk VPS / Komputer dengan banyak akun:
 
 1. Siapkan file akun `accounts.txt` dengan format `email|password` per baris:
    ```text
