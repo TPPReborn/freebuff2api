@@ -1,0 +1,25 @@
+name = "freebuff2api"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+[vars]
+# API Key untuk autentikasi client
+API_KEY = "freebuff-default-key"
+
+# Mode Debug (true / false)
+FREEBUFF_DEBUG = "false"
+
+# Daftarkan token akun Codebuff/Freebuff di sini
+# Format multi-token: pisahkan dengan baris baru (newline) atau koma
+# Contoh:
+# FREEBUFF_TOKEN = """
+# token_1_disini
+# token_2_disini
+# """
+FREEBUFF_TOKEN = ""
+
+# Note: Jika di-deploy langsung ke Cloudflare Workers (mode Standalone/Direct),
+# request langsung keluar dari edge network Cloudflare (Egress US) ke upstream Codebuff,
+# sehingga TIDAK MEMERLUKAN RELAY EKSTERNAL lagi!
+# Biarkan RELAY_URL kosong:
+RELAY_URL = ""

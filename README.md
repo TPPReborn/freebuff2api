@@ -2,7 +2,9 @@
 
 Freebuff2API adalah gateway API berkinerja tinggi yang mengubah akun Codebuff/Freebuff menjadi endpoint yang **100% kompatibel dengan OpenAI API (`/v1/chat/completions`) dan Anthropic API (`/v1/messages`)**. 
 
-Dilengkapi dengan arsitektur **Multi-Account Auto Rotation**, **Cloudflare Worker US Relay Proxy**, **Smart 429 Cooldown & Rate Limit Guard**, serta **Automated Token Harvester**.
+Mendukung **2 Mode Deployment**:
+1. **Direct Cloudflare Workers (Serverless / Tanpa Relay)**: Deploy langsung seluruh gateway ke Cloudflare Workers tanpa butuh VPS dan tanpa butuh relay tambahan (karena sudah otomatis jalan di Cloudflare US Edge).
+2. **Self-Hosted VPS / Docker + US Relay**: Menjalankan server di VPS/Docker lokal dengan Cloudflare Worker Relay sebagai proxy egress US.
 
 ---
 
@@ -10,7 +12,8 @@ Dilengkapi dengan arsitektur **Multi-Account Auto Rotation**, **Cloudflare Worke
 
 - 🔄 **OpenAI & Anthropic Compatible**: Dukungan endpoint `/v1/chat/completions`, `/v1/models`, `/v1/responses`, dan `/v1/messages`.
 - ⚡ **Full Streaming Support**: Server-Sent Events (SSE) stream real-time dengan delta reasoning tokens.
-- 🛡️ **Cloudflare US Relay Proxy**: Menyamarkan IP VPS/Server dan menyuntikkan signature header Codebuff CLI secara otomatis agar tidak terkena ban geo-blocking/country block.
+- ☁️ **Direct Cloudflare Workers Support**: Bisa di-deploy langsung ke Cloudflare Workers (serverless, gratis, tanpa butuh relay atau VPS).
+- 🛡️ **Cloudflare US Relay Proxy**: Untuk deployment VPS/Docker agar IP VPS tersamarkan dan terhindar dari geo-blocking.
 - 🔄 **Multi-Relay Load Balancer**: Dukungan multi-relay Cloudflare Workers dengan mekanisme rotasi dan automatic failover.
 - 👥 **Multi-Account Pool & Rotation**: Load-balancing akun secara otomatis, smart session reuse, dan isolasi akun.
 - ⏱️ **Smart 429 Rate Limit Guard**: Mendeteksi waktu reset (`retryAfterMs` / `resetsAt` / `Retry-After`) dari upstream, langsung menempatkan akun ke masa cooldown tanpa spamming pembuatan session baru.
@@ -19,78 +22,95 @@ Dilengkapi dengan arsitektur **Multi-Account Auto Rotation**, **Cloudflare Worke
 
 ---
 
-## 📐 Arsitektur Sistem
+## 📐 Pilihan Arsitektur
 
+### Opsi A: Direct Cloudflare Workers (Serverless — Tanpa VPS / Tanpa Relay Eksternal)
 ```
-[Client / Cursor / NextChat / Cline]
-                 │
-                 ▼  (Bearer freebuff-default-key)
-      ┌─────────────────────┐
-      │  Freebuff2API Host  │  (Port 8787 / Docker)
-      │  (Node.js Gateway)  │
-      └──────────┬──────────┘
-                 │
-                 ├──► [Multi-Account Credential Pool] (credentials/*.json)
-                 │    ├── Smart Session Cache (`sessCache`)
-                 │    └── Auto-Cooldown on 429 (`parseCooldown`)
-                 │
-                 ▼  (Round-robin / Failover)
-      ┌───────────────────────────────────────────────┐
-      │  Cloudflare Worker US Relay Proxy             │
-      │  - freebuff-relay-us.workers.dev             │
-      │  - freebuff-relay-us2.workers.dev            │
-      │  (Strip CF headers, spoof UA, inject CLI SDK) │
-      └──────────────────────┬────────────────────────┘
-                             │
-                             ▼  (US Egress IP)
-               ┌───────────────────────────┐
-               │   Codebuff Upstream API   │
-               │   (codebuff.com/api/v1)   │
-               └───────────────────────────┘
+[Client / Cursor / NextChat] ──► [Cloudflare Worker: freebuff2api] ──► [Codebuff Upstream]
+                                 (Handle OpenAI/Anthropic, Pool Token,
+                                  Session Cache, Direct US Egress)
+```
+
+### Opsi B: Self-Hosted VPS / Docker + US Relay Proxy
+```
+[Client] ──► [VPS / Docker: freebuff2api:8787] ──► [CF Worker Relay] ──► [Codebuff Upstream]
+             (Local Credentials Pool)               (US Egress Proxy)
 ```
 
 ---
 
 ## 📋 Daftar Isi
 
-1. [Cara Deploy Cloudflare Worker Relay](#1-deploy-cloudflare-worker-relay)
-2. [Cara Panen Akun & Token (Harvesting)](#2-panen-akun--token-harvesting)
-3. [Menjalankan Server dengan Docker](#3-menjalankan-server-dengan-docker)
-4. [Menjalankan Server Manual (Node.js)](#4-menjalankan-server-manual-nodejs)
-5. [Contoh Pemanggilan API](#5-contoh-pemanggilan-api)
-6. [Daftar Model yang Didukung](#6-daftar-model-yang-didukung)
+1. [Opsi 1: Deploy Langsung ke Cloudflare Workers (Direct / Serverless)](#opsi-1-deploy-langsung-ke-cloudflare-workers-direct--serverless)
+2. [Opsi 2: Deploy Menggunakan Docker / VPS + Relay](#opsi-2-deploy-menggunakan-docker--vps--relay)
+3. [Cara Panen Akun & Token (Harvesting)](#3-cara-panen-akun--token-harvesting)
+4. [Contoh Pemanggilan API](#4-contoh-pemanggilan-api)
+5. [Daftar Model yang Didukung](#5-daftar-model-yang-didukung)
 
 ---
 
-## 1. Deploy Cloudflare Worker Relay
+## Opsi 1: Deploy Langsung ke Cloudflare Workers (Direct / Serverless)
 
-Relay worker bertindak sebagai reverse proxy yang berjalan di Cloudflare edge network (US colo) untuk memastikan semua request ke Codebuff berasal dari IP US dan memiliki header CLI yang valid.
+Mode ini adalah cara paling mudah, cepat, dan **tidak membutuhkan VPS atau relay terpisah**. Gateway API langsung berjalan di jaringan edge Cloudflare.
 
 ### Langkah Deploy:
 
-1. Masuk ke direktori relay:
+1. Clone repository:
    ```bash
-   cd relay
+   git clone https://github.com/TPPReborn/freebuff2api.git
+   cd freebuff2api
    ```
 
-2. Pastikan `wrangler` sudah terpasang:
-   ```bash
-   npm install -g wrangler
+2. Edit `wrangler.toml`:
+   ```toml
+   name = "freebuff2api"
+   main = "worker.js"
+   compatibility_date = "2024-01-01"
+
+   [vars]
+   API_KEY = "freebuff-default-key"
+   FREEBUFF_DEBUG = "false"
+   RELAY_URL = "" # Biarkan kosong karena worker sudah berada di Cloudflare US Edge!
+   
+   # Isi authToken hasil panen (bisa 1 atau banyak token dipisah newline):
+   FREEBUFF_TOKEN = """
+   token_akun_1
+   token_akun_2
+   token_akun_3
+   """
    ```
 
-3. Deploy relay pertama:
+3. Deploy ke Cloudflare:
    ```bash
-   CLOUDFLARE_API_TOKEN="your-cf-token" wrangler deploy --name freebuff-relay-us
+   CLOUDFLARE_API_TOKEN="your-cf-token" npx wrangler deploy
    ```
 
-4. *(Opsional)* Deploy relay kedua untuk multi-relay redundancy:
-   ```bash
-   CLOUDFLARE_API_TOKEN="your-cf-token" wrangler deploy --name freebuff-relay-us2
-   ```
+4. Selesai! Endpoint Anda sekarang siap digunakan:
+   `https://freebuff2api.<your-subdomain>.workers.dev/v1/chat/completions`
 
 ---
 
-## 2. Panen Akun & Token (Harvesting)
+## Opsi 2: Deploy Menggunakan Docker / VPS + Relay
+
+Gunakan opsi ini jika Anda ingin mengelola token di server lokal/VPS via file JSON credentials.
+
+### Langkah 1: Deploy Relay US (Cloudflare)
+```bash
+cd relay
+CLOUDFLARE_API_TOKEN="your-cf-token" npx wrangler deploy --name freebuff-relay-us
+```
+
+### Langkah 2: Jalankan Server via Docker Compose
+1. Tempatkan file JSON token di `./credentials/` (misal: `acc1.json`, `acc2.json`).
+2. Jalankan docker compose:
+   ```bash
+   docker compose up -d --build
+   ```
+3. Endpoint API aktif di: `http://<ip-vps>:8787/v1/chat/completions`
+
+---
+
+## 3. Cara Panen Akun & Token (Harvesting)
 
 Freebuff2API menyertakan script harvester otomatis berbasis **Playwright** yang dapat menangani:
 - Google Sign-In standar
@@ -118,74 +138,19 @@ Freebuff2API menyertakan script harvester otomatis berbasis **Playwright** yang 
    python3 harvest_accounts.py --file accounts.txt --out ../credentials
    ```
 
-4. Cek validitas dan status `accessTier` akun:
+4. Cek validitas dan status `accessTier: full` akun:
    ```bash
    python3 check_accounts.py --relay https://freebuff-relay-us.your-subdomain.workers.dev
    ```
 
 ---
 
-## 3. Menjalankan Server dengan Docker
-
-### Menggunakan Docker Compose (Direkomendasikan):
-
-1. Pastikan file credential sudah ada di folder `./credentials/*.json`.
-2. Edit file `docker-compose.yml` untuk menyesuaikan URL relay dan API key:
-   ```yaml
-   version: '3.8'
-   services:
-     freebuff2api:
-       build: .
-       container_name: freebuff2api
-       restart: unless-stopped
-       ports:
-         - "8787:8787"
-       environment:
-         - PORT=8787
-         - API_KEY=freebuff-default-key
-         - RELAY_URL=https://freebuff-relay-us.workers.dev,https://freebuff-relay-us2.workers.dev
-         - FREEBUFF_DEBUG=false
-       volumes:
-         - ./credentials:/app/credentials
-   ```
-
-3. Jalankan container:
-   ```bash
-   docker compose up -d --build
-   ```
-
-4. Cek log server:
-   ```bash
-   docker compose logs -f
-   ```
-
----
-
-## 4. Menjalankan Server Manual (Node.js)
-
-1. Pastikan Node.js v18+ terinstall:
-   ```bash
-   node -v
-   ```
-
-2. Jalankan server:
-   ```bash
-   export PORT=8787
-   export API_KEY="freebuff-default-key"
-   export RELAY_URL="https://freebuff-relay-us.workers.dev,https://freebuff-relay-us2.workers.dev"
-   export FREEBUFF_CRED_DIR="./credentials"
-
-   node server.js
-   ```
-
----
-
-## 5. Contoh Pemanggilan API
+## 4. Contoh Pemanggilan API
 
 ### A. OpenAI Format (`/v1/chat/completions`)
 
 ```bash
-curl http://localhost:8787/v1/chat/completions \
+curl https://freebuff2api.your-subdomain.workers.dev/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer freebuff-default-key" \
   -d '{
@@ -197,10 +162,10 @@ curl http://localhost:8787/v1/chat/completions \
   }'
 ```
 
-### B. Streaming Response
+### B. Streaming Response (SSE)
 
 ```bash
-curl http://localhost:8787/v1/chat/completions \
+curl https://freebuff2api.your-subdomain.workers.dev/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer freebuff-default-key" \
   -d '{
@@ -215,7 +180,7 @@ curl http://localhost:8787/v1/chat/completions \
 ### C. Anthropic Format (`/v1/messages`)
 
 ```bash
-curl http://localhost:8787/v1/messages \
+curl https://freebuff2api.your-subdomain.workers.dev/v1/messages \
   -H "Content-Type: application/json" \
   -H "x-api-key: freebuff-default-key" \
   -H "anthropic-version: 2023-06-01" \
@@ -230,7 +195,7 @@ curl http://localhost:8787/v1/messages \
 
 ---
 
-## 6. Daftar Model yang Didukung
+## 5. Daftar Model yang Didukung
 
 - `deepseek/deepseek-v4-flash` *(Default, sangat cepat & hemat kuota)*
 - `deepseek/deepseek-chat`
