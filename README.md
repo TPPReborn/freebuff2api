@@ -1,25 +1,25 @@
 # 🚀 Freebuff2API (Codebuff OpenAI & Anthropic API Gateway)
 
-Freebuff2API adalah gateway API berkinerja tinggi yang mengubah akun Codebuff/Freebuff menjadi endpoint yang **100% kompatibel dengan OpenAI API (`/v1/chat/completions`) dan Anthropic API (`/v1/messages`)**. 
+Freebuff2API adalah gateway API berkinerja tinggi yang mengubah akun Codebuff/Freebuff menjadi endpoint yang **100% kompatibel dengan OpenAI API (`/v1/chat/completions`) dan Anthropic API (`/v1/messages`)**.
 
-Mendukung **2 Mode Deployment**:
-1. **Direct Cloudflare Workers (Serverless / Tanpa Relay)**: Deploy langsung seluruh gateway ke Cloudflare Workers tanpa butuh VPS dan tanpa butuh relay tambahan (karena sudah otomatis jalan di Cloudflare US Edge).
-2. **Self-Hosted VPS / Docker + US Relay**: Menjalankan server di VPS/Docker lokal dengan Cloudflare Worker Relay sebagai proxy egress US.
+Mendukung **3 Mode Deployment**:
+1. ☁️ **Cloudflare Workers (Wrangler / Serverless)**: Tanpa VPS, tanpa relay, deploy langsung ke Cloudflare US edge.
+2. 🐳 **Docker / Docker Compose**: Siap pakai untuk server/VPS dengan container isolation.
+3. 📱 **Native Node.js & Termux (Android)**: Tanpa Docker, ringan, dan bisa dijalankan langsung di HP Android via Termux atau VPS minim RAM.
 
 ---
 
 ## 🌟 Fitur Utama
 
 - 🔄 **OpenAI & Anthropic Compatible**: Dukungan endpoint `/v1/chat/completions`, `/v1/models`, `/v1/responses`, dan `/v1/messages`.
+- 👁️ **Full Vision / Multimodal Support**: Support input gambar (Base64 & URL gambar) pada model seperti `deepseek/deepseek-v4-flash`.
 - ⚡ **Full Streaming Support**: Server-Sent Events (SSE) stream real-time dengan delta reasoning tokens.
-- 🔀 **9Router Ready**: Sangat mudah dihubungkan ke [9Router](https://github.com/TPPReborn/9router) sebagai custom provider.
-- ☁️ **Direct Cloudflare Workers Support**: Bisa di-deploy langsung ke Cloudflare Workers (serverless, gratis, tanpa butuh relay atau VPS).
-- 🛡️ **Cloudflare US Relay Proxy**: Untuk deployment VPS/Docker agar IP VPS tersamarkan dan terhindar dari geo-blocking.
-- 🔄 **Multi-Relay Load Balancer**: Dukungan multi-relay Cloudflare Workers dengan mekanisme rotasi dan automatic failover.
-- 👥 **Multi-Account Pool & Rotation**: Load-balancing akun secara otomatis, smart session reuse, dan isolasi akun.
-- ⏱️ **Smart 429 Rate Limit Guard**: Mendeteksi waktu reset (`retryAfterMs` / `resetsAt` / `Retry-After`) dari upstream, langsung menempatkan akun ke masa cooldown tanpa spamming pembuatan session baru.
-- 🤖 **Automated Playwright Harvester**: Script otomatisasi login Google (Gmail & Google Workspace for Education) untuk memanen `authToken` dan `accessTier: full`.
-- 🐳 **Docker & Docker Compose Ready**: Siap dijalankan langsung di VPS manapun dengan isolasi container.
+- 🔀 **9Router Ready**: Terintegrasi mulus dengan [9Router](https://github.com/TPPReborn/9router) sebagai custom provider.
+- 🛡️ **Anti-Detection Mimic**: Meniru signature CLI resmi (`codebuff-cli/1.0.685`, SDK `0.0.141`, `client-type: cli`) dan membersihkan header proxy agar tidak terdeteksi WAF.
+- 🔄 **Multi-Relay Load Balancer**: Dukungan multi-relay Cloudflare Workers dengan rotasi otomatis dan failover.
+- 👥 **Multi-Account Pool**: Load-balancing akun secara otomatis dengan isolasi session dan reuse cache.
+- ⏱️ **Smart 429 Rate Limit Guard**: Otomatis membaca waktu reset (`retryAfterMs` / `resetsAt`) dan jeda akun tanpa spamming session.
+- 🤖 **Automated Playwright Harvester**: Auto-login akun Google / Google Workspace for Education + auto-sync ke Wrangler/Docker.
 
 ---
 
@@ -32,32 +32,32 @@ Mendukung **2 Mode Deployment**:
                                  Session Cache, Direct US Egress)
 ```
 
-### Opsi B: Self-Hosted VPS / Docker + US Relay Proxy
+### Opsi B: Self-Hosted (Docker / Native Linux / Termux Android) + US Relay
 ```
-[Client / 9Router] ──► [VPS / Docker: freebuff2api:8787] ──► [CF Worker Relay] ──► [Codebuff Upstream]
-                       (Local Credentials Pool)               (US Egress Proxy)
+[Client / 9Router] ──► [Local Server: 8787] ──► [CF Worker Relay] ──► [Codebuff Upstream]
+                       (Docker / Termux / VPS)   (US Egress Proxy)
 ```
 
 ---
 
 ## 📋 Daftar Isi
 
-1. [Opsi 1: Deploy Langsung ke Cloudflare Workers (Direct / Serverless)](#opsi-1-deploy-langsung-ke-cloudflare-workers-direct--serverless)
-2. [Opsi 2: Deploy Menggunakan Docker / VPS + Relay](#opsi-2-deploy-menggunakan-docker--vps--relay)
-3. [Cara Panen Akun & Token (Harvesting)](#3-cara-panen-akun--token-harvesting)
-4. [Cara Sambungkan ke 9Router](#4-cara-sambungkan-ke-9router)
-5. [Contoh Pemanggilan API](#5-contoh-pemanggilan-api)
-6. [Daftar Model yang Didukung](#6-daftar-model-yang-didukung)
+1. [Opsi 1: Deploy Langsung ke Cloudflare Workers (Wrangler / Serverless)](#opsi-1-deploy-langsung-ke-cloudflare-workers-wrangler--serverless)
+2. [Opsi 2: Deploy Menggunakan Docker Compose (VPS / Server)](#opsi-2-deploy-menggunakan-docker-compose-vps--server)
+3. [Opsi 3: Deploy Native di Linux / Termux Android](#opsi-3-deploy-native-di-linux--termux-android)
+4. [Cara Cek Status & AccessTier Akun](#4-cara-cek-status--accesstier-akun)
+5. [Cara Panen Akun & Token (Harvesting)](#5-cara-panen-akun--token-harvesting)
+6. [Cara Sambungkan ke 9Router](#6-cara-sambungkan-ke-9router)
+7. [Contoh Pemanggilan API](#7-contoh-pemanggilan-api)
+8. [Daftar Model yang Didukung](#8-daftar-model-yang-didukung)
 
 ---
 
-## Opsi 1: Deploy Langsung ke Cloudflare Workers (Direct / Serverless)
+## Opsi 1: Deploy Langsung ke Cloudflare Workers (Wrangler / Serverless)
 
-Mode ini adalah cara paling mudah, cepat, dan **tidak membutuhkan VPS atau relay terpisah**. Gateway API langsung berjalan di jaringan edge Cloudflare.
+Mode paling praktis tanpa butuh server/VPS dan tanpa perlu relay terpisah.
 
-### Langkah Deploy:
-
-1. Clone repository:
+1. Clone repo:
    ```bash
    git clone https://github.com/TPPReborn/freebuff2api.git
    cd freebuff2api
@@ -74,11 +74,10 @@ Mode ini adalah cara paling mudah, cepat, dan **tidak membutuhkan VPS atau relay
    FREEBUFF_DEBUG = "false"
    RELAY_URL = "" # Biarkan kosong karena worker sudah berada di Cloudflare US Edge!
    
-   # Isi authToken hasil panen (bisa 1 atau banyak token dipisah newline):
+   # Isi authToken hasil panen:
    FREEBUFF_TOKEN = """
    token_akun_1
    token_akun_2
-   token_akun_3
    """
    ```
 
@@ -87,18 +86,79 @@ Mode ini adalah cara paling mudah, cepat, dan **tidak membutuhkan VPS atau relay
    CLOUDFLARE_API_TOKEN="your-cf-token" npx wrangler deploy
    ```
 
-4. Selesai! Endpoint Anda sekarang siap digunakan:
-   - Chat Endpoint: `https://freebuff2api.<your-subdomain>.workers.dev/v1/chat/completions`
-   - Cek Status & AccessTier Akun: `https://freebuff2api.<your-subdomain>.workers.dev/v1/accounts`
+4. Endpoint siap digunakan:
+   - Chat: `https://freebuff2api.<your-subdomain>.workers.dev/v1/chat/completions`
+   - Cek Status Akun: `https://freebuff2api.<your-subdomain>.workers.dev/v1/accounts`
 
 ---
 
-## 2. Cara Cek Status & AccessTier Akun
+## Opsi 2: Deploy Menggunakan Docker Compose (VPS / Server)
 
-Freebuff2API menyediakan endpoint khusus untuk melihat status seluruh akun, `accessTier` (`full` / `standard`), dan limit kuota:
+1. Deploy relay Cloudflare (untuk bypass geo-block jika VPS di luar US):
+   ```bash
+   cd relay
+   CLOUDFLARE_API_TOKEN="your-cf-token" npx wrangler deploy --name freebuff-relay-us
+   cd ..
+   ```
+
+2. Tempatkan file JSON token di `./credentials/` (misal: `acc1.json`, `acc2.json`).
+
+3. Jalankan container:
+   ```bash
+   docker compose up -d --build
+   ```
+
+4. Endpoint API aktif di: `http://<ip-vps>:8787/v1/chat/completions`
+
+---
+
+## Opsi 3: Deploy Native di Linux / Termux Android
+
+Mode ini sangat ringan dan bisa dijalankan langsung di smartphone Android via **Termux** atau di VPS tanpa Docker.
+
+### A. Di Termux (Android):
+
+1. Buka Termux dan jalankan one-line installer:
+   ```bash
+   pkg update -y && pkg install -y git nodejs
+   git clone https://github.com/TPPReborn/freebuff2api.git
+   cd freebuff2api
+   chmod +x start.sh termux-install.sh
+   ```
+
+2. Salin file environment:
+   ```bash
+   cp .env.example .env
+   ```
+   *(Edit `.env` jika ingin mengganti PORT, API_KEY, atau RELAY_URL)*
+
+3. Masukkan file JSON token ke folder `./credentials/` (atau buat file `acc1.json` yang berisi `{"authToken": "token_anda"}`).
+
+4. Jalankan gateway:
+   ```bash
+   ./start.sh
+   ```
+   Server aktif di `http://localhost:8787` (bisa diakses oleh aplikasi lokal Android, Cursor, atau NextChat).
+
+---
+
+### B. Di Linux Native / VPS (Tanpa Docker):
 
 ```bash
-curl https://freebuff2api.<your-subdomain>.workers.dev/v1/accounts \
+git clone https://github.com/TPPReborn/freebuff2api.git
+cd freebuff2api
+cp .env.example .env
+npm start
+```
+
+---
+
+## 4. Cara Cek Status & AccessTier Akun
+
+Freebuff2API menyediakan endpoint bawaan untuk melihat status seluruh akun, `accessTier` (`full` / `standard`), dan kuota pool:
+
+```bash
+curl http://localhost:8787/v1/accounts \
   -H "Authorization: Bearer freebuff-default-key"
 ```
 
@@ -120,8 +180,7 @@ curl https://freebuff2api.<your-subdomain>.workers.dev/v1/accounts \
       "rateLimit": {
         "model": "deepseek/deepseek-v4-flash",
         "limit": 5,
-        "pool": "premium",
-        "poolLabel": "Premium"
+        "pool": "premium"
       },
       "inCooldown": false,
       "cooldownRemainingSeconds": 0
@@ -132,35 +191,9 @@ curl https://freebuff2api.<your-subdomain>.workers.dev/v1/accounts \
 
 ---
 
-## Opsi 2: Deploy Menggunakan Docker / VPS + Relay
+## 5. Cara Panen Akun & Token (Harvesting)
 
-Gunakan opsi ini jika Anda ingin mengelola token di server lokal/VPS via file JSON credentials.
-
-### Langkah 1: Deploy Relay US (Cloudflare)
-```bash
-cd relay
-CLOUDFLARE_API_TOKEN="your-cf-token" npx wrangler deploy --name freebuff-relay-us
-```
-
-### Langkah 2: Jalankan Server via Docker Compose
-1. Tempatkan file JSON token di `./credentials/` (misal: `acc1.json`, `acc2.json`).
-2. Jalankan docker compose:
-   ```bash
-   docker compose up -d --build
-   ```
-3. Endpoint API aktif di: `http://<ip-vps>:8787/v1/chat/completions`
-
----
-
-## 3. Cara Panen Akun & Token (Harvesting)
-
-Freebuff2API menyertakan script harvester otomatis berbasis **Playwright** yang dapat menangani:
-- Google Sign-In standar
-- Google Workspace for Education (Speedbump Terms of Service & "I understand" prompt)
-- OAuth Consent Page ("Izinkan / Allow")
-- CLI code polling dan penyimpanan JSON otomatis.
-
-### Cara Menggunakan Harvester:
+Freebuff2API menyertakan script harvester otomatis berbasis **Playwright** untuk login Google (Gmail & Google Workspace), melewati Terms of Service & Consent, lalu mengambil token secara otomatis.
 
 1. Siapkan file akun `accounts.txt` dengan format `email|password` per baris:
    ```text
@@ -168,175 +201,83 @@ Freebuff2API menyertakan script harvester otomatis berbasis **Playwright** yang 
    user2@dewaa.id|Password123##
    ```
 
-2. Install dependencies python:
+2. Jalankan automated harvester sesuai kebutuhan:
+
+   **A. Simpan ke JSON credentials:**
    ```bash
-   cd tools
-   pip install -r requirements.txt
-   playwright install chromium
+   python3 tools/harvest_accounts.py --file accounts.txt --out ./credentials
    ```
 
-3. Jalankan automated harvester:
-   
-   **A. Mode Standar (Simpan ke JSON credentials):**
-   ```bash
-   python3 harvest_accounts.py --file accounts.txt --out ../credentials
-   ```
-
-   **B. Mode Auto-Sync ke Cloudflare Workers (Wrangler):**
+   **B. Auto-Sync ke Cloudflare Workers (Wrangler):**
    ```bash
    # Otomatis update FREEBUFF_TOKEN di wrangler.toml & deploy langsung ke Cloudflare:
-   python3 harvest_accounts.py --file accounts.txt --deploy-wrangler
+   python3 tools/harvest_accounts.py --file accounts.txt --deploy-wrangler
    ```
 
-   **C. Mode Auto-Reload Docker Container:**
+   **C. Auto-Reload Docker Container:**
    ```bash
    # Otomatis restart container Docker setelah selesai panen:
-   python3 harvest_accounts.py --file accounts.txt --reload-docker
-   ```
-
-4. Cek validitas dan status `accessTier: full` akun:
-   ```bash
-   python3 check_accounts.py --relay https://freebuff-relay-us.your-subdomain.workers.dev
+   python3 tools/harvest_accounts.py --file accounts.txt --reload-docker
    ```
 
 ---
 
-## 4. Cara Sambungkan ke 9Router
+## 6. Cara Sambungkan ke 9Router
 
-[9Router](https://github.com/TPPReborn/9router) adalah AI multi-provider router. Anda bisa menambahkan Freebuff2API sebagai custom provider di 9Router dengan dua cara:
+Freebuff2API dapat didaftarkan sebagai custom provider di [9Router](https://github.com/TPPReborn/9router):
 
-### Cara A: Melalui GUI Web UI 9Router
-
-1. Buka Web UI 9Router (misal: `http://localhost:20128`).
-2. Masuk ke menu **Providers** -> Klik **Add Provider**.
-3. Pilih **OpenAI Compatible**:
+### Melalui Web UI 9Router:
+1. Buka dashboard 9Router -> Menu **Providers** -> **Add Provider**.
+2. Pilih **OpenAI Compatible**:
    - **Provider Name**: `Freebuff`
-   - **Base URL**: 
-     - Jika VPS/Docker: `http://127.0.0.1:8787/v1`
-     - Jika Cloudflare Worker: `https://freebuff2api.<your-subdomain>.workers.dev/v1`
-   - **API Key**: `freebuff-default-key` (sesuai yang diset di env/wrangler)
-   - **Prefix**: `fb`
-4. Di bagian **Models**, tambahkan model-model berikut:
-   - `deepseek/deepseek-v4-flash`
-   - `claude-3-5-sonnet-20241022`
-   - `gpt-4o`
-5. Simpan. Model sekarang bisa diakses melalui 9Router dengan format: `fb/deepseek/deepseek-v4-flash`.
+   - **Base URL**: `http://127.0.0.1:8787/v1` (atau URL Cloudflare Worker)
+   - **API Key**: `freebuff-default-key`
+   - **Prefix**: `fbv`
+3. Tambahkan model: `deepseek/deepseek-v4-flash`, `deepseek/deepseek-v4-pro`, dll.
+4. Model sekarang bisa diakses di 9Router via `fbv/deepseek/deepseek-v4-flash` (support text + vision multimodal).
 
 ---
 
-### Cara B: Otomatis via Script SQLite 9Router
+## 7. Contoh Pemanggilan API
 
-Jika Anda mengelola 9Router di server/VPS, Anda bisa mendaftarkan Freebuff2API langsung ke database 9Router (`~/.9router/db/data.sqlite`):
-
-```python
-import sqlite3, uuid, json
-
-DB_PATH = "/root/.9router/db/data.sqlite"
-db = sqlite3.connect(DB_PATH)
-
-# 1. Daftarkan Provider Node
-node_id = "openai-compatible-chat-" + uuid.uuid4().hex[:24]
-node_data = {
-    "prefix": "fb",
-    "apiType": "chat",
-    "baseUrl": "http://127.0.0.1:8787/v1" # atau URL Worker Cloudflare
-}
-db.execute("""
-INSERT INTO providerNodes(id, type, name, data, createdAt, updatedAt)
-VALUES (?, 'openai-compatible', 'Freebuff', ?, datetime('now'), datetime('now'))
-""", (node_id, json.dumps(node_data)))
-
-# 2. Daftarkan Connection / API Key
-conn_id = "conn-" + uuid.uuid4().hex[:24]
-conn_data = {
-    "apiKey": "freebuff-default-key",
-    "testStatus": "ok",
-    "providerSpecificData": {}
-}
-db.execute("""
-INSERT INTO providerConnections(id, provider, authType, name, priority, isActive, data, createdAt, updatedAt)
-VALUES (?, ?, 'apikey', 'Default Key', 1, 1, ?, datetime('now'), datetime('now'))
-""", (conn_id, node_id, json.dumps(conn_data)))
-
-# 3. (Opsional) Buat Model Combo Alias
-combos = [
-    ("deepseek-v4-flash", ["fb/deepseek/deepseek-v4-flash"]),
-    ("freebuff-claude", ["fb/claude-3-5-sonnet-20241022"])
-]
-for name, models in combos:
-    combo_id = "combo-" + uuid.uuid4().hex[:24]
-    db.execute("""
-    INSERT OR REPLACE INTO combos(id, name, kind, models, createdAt, updatedAt)
-    VALUES (?, ?, '', ?, datetime('now'), datetime('now'))
-    """, (combo_id, name, json.dumps(models)))
-
-db.commit()
-db.close()
-print("Berhasil menyambungkan Freebuff2API ke 9Router!")
-```
-
----
-
-## 5. Contoh Pemanggilan API
-
-### A. OpenAI Format (`/v1/chat/completions`)
-
+### A. OpenAI Chat Format (`/v1/chat/completions`)
 ```bash
-curl https://freebuff2api.your-subdomain.workers.dev/v1/chat/completions \
+curl http://localhost:8787/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer freebuff-default-key" \
   -d '{
     "model": "deepseek/deepseek-v4-flash",
-    "messages": [
-      {"role": "user", "content": "Halo! Siapa kamu?"}
-    ],
-    "stream": false
+    "messages": [{"role": "user", "content": "Halo! Siapa kamu?"}]
   }'
 ```
 
-### B. Streaming Response (SSE)
-
+### B. Vision / Multimodal (Kirim Gambar)
 ```bash
-curl https://freebuff2api.your-subdomain.workers.dev/v1/chat/completions \
+curl http://localhost:8787/v1/chat/completions \
   -H "Content-Type: application/json" \
   -H "Authorization: Bearer freebuff-default-key" \
   -d '{
     "model": "deepseek/deepseek-v4-flash",
-    "messages": [
-      {"role": "user", "content": "Tuliskan puisi pendek tentang alam"}
-    ],
-    "stream": true
-  }'
-```
-
-### C. Anthropic Format (`/v1/messages`)
-
-```bash
-curl https://freebuff2api.your-subdomain.workers.dev/v1/messages \
-  -H "Content-Type: application/json" \
-  -H "x-api-key: freebuff-default-key" \
-  -H "anthropic-version: 2023-06-01" \
-  -d '{
-    "model": "claude-3-5-sonnet-20241022",
-    "messages": [
-      {"role": "user", "content": "Hello Claude!"}
-    ],
-    "max_tokens": 1024
+    "messages": [{
+      "role": "user",
+      "content": [
+        {"type": "text", "text": "Jelaskan gambar ini"},
+        {"type": "image_url", "image_url": {"url": "https://example.com/image.png"}}
+      ]
+    }]
   }'
 ```
 
 ---
 
-## 6. Daftar Model yang Didukung
+## 8. Daftar Model yang Didukung
 
-- `deepseek/deepseek-v4-flash` *(Default, sangat cepat & hemat kuota)*
-- `deepseek/deepseek-chat`
-- `deepseek/deepseek-reasoner`
-- `claude-3-5-sonnet-20241022` / `anthropic/claude-3.5-sonnet`
-- `claude-3-5-haiku-20241022`
-- `gpt-4o` / `openai/gpt-4o`
-- `gpt-4o-mini`
-- `qwen/qwen-2.5-coder-32b-instruct`
+- `deepseek/deepseek-v4-flash` *(Default, sangat cepat, vision support, kuota besar)*
+- `deepseek/deepseek-v4-pro` *(Heavy reasoning)*
+- `openai/gpt-5.6-luna`
+- `minimax/minimax-m3`
+- `crof/kimi-k3-eco`
+- `mimo/mimo-v2.5`
 
 ---
 
