@@ -12,6 +12,7 @@ Mendukung **2 Mode Deployment**:
 
 - 🔄 **OpenAI & Anthropic Compatible**: Dukungan endpoint `/v1/chat/completions`, `/v1/models`, `/v1/responses`, dan `/v1/messages`.
 - ⚡ **Full Streaming Support**: Server-Sent Events (SSE) stream real-time dengan delta reasoning tokens.
+- 🔀 **9Router Ready**: Sangat mudah dihubungkan ke [9Router](https://github.com/TPPReborn/9router) sebagai custom provider.
 - ☁️ **Direct Cloudflare Workers Support**: Bisa di-deploy langsung ke Cloudflare Workers (serverless, gratis, tanpa butuh relay atau VPS).
 - 🛡️ **Cloudflare US Relay Proxy**: Untuk deployment VPS/Docker agar IP VPS tersamarkan dan terhindar dari geo-blocking.
 - 🔄 **Multi-Relay Load Balancer**: Dukungan multi-relay Cloudflare Workers dengan mekanisme rotasi dan automatic failover.
@@ -26,15 +27,15 @@ Mendukung **2 Mode Deployment**:
 
 ### Opsi A: Direct Cloudflare Workers (Serverless — Tanpa VPS / Tanpa Relay Eksternal)
 ```
-[Client / Cursor / NextChat] ──► [Cloudflare Worker: freebuff2api] ──► [Codebuff Upstream]
-                                 (Handle OpenAI/Anthropic, Pool Token,
-                                  Session Cache, Direct US Egress)
+[Client / 9Router / Cursor] ──► [Cloudflare Worker: freebuff2api] ──► [Codebuff Upstream]
+                                (Handle OpenAI/Anthropic, Pool Token,
+                                 Session Cache, Direct US Egress)
 ```
 
 ### Opsi B: Self-Hosted VPS / Docker + US Relay Proxy
 ```
-[Client] ──► [VPS / Docker: freebuff2api:8787] ──► [CF Worker Relay] ──► [Codebuff Upstream]
-             (Local Credentials Pool)               (US Egress Proxy)
+[Client / 9Router] ──► [VPS / Docker: freebuff2api:8787] ──► [CF Worker Relay] ──► [Codebuff Upstream]
+                       (Local Credentials Pool)               (US Egress Proxy)
 ```
 
 ---
@@ -44,8 +45,9 @@ Mendukung **2 Mode Deployment**:
 1. [Opsi 1: Deploy Langsung ke Cloudflare Workers (Direct / Serverless)](#opsi-1-deploy-langsung-ke-cloudflare-workers-direct--serverless)
 2. [Opsi 2: Deploy Menggunakan Docker / VPS + Relay](#opsi-2-deploy-menggunakan-docker--vps--relay)
 3. [Cara Panen Akun & Token (Harvesting)](#3-cara-panen-akun--token-harvesting)
-4. [Contoh Pemanggilan API](#4-contoh-pemanggilan-api)
-5. [Daftar Model yang Didukung](#5-daftar-model-yang-didukung)
+4. [Cara Sambungkan ke 9Router](#4-cara-sambungkan-ke-9router)
+5. [Contoh Pemanggilan API](#5-contoh-pemanggilan-api)
+6. [Daftar Model yang Didukung](#6-daftar-model-yang-didukung)
 
 ---
 
@@ -145,7 +147,83 @@ Freebuff2API menyertakan script harvester otomatis berbasis **Playwright** yang 
 
 ---
 
-## 4. Contoh Pemanggilan API
+## 4. Cara Sambungkan ke 9Router
+
+[9Router](https://github.com/TPPReborn/9router) adalah AI multi-provider router. Anda bisa menambahkan Freebuff2API sebagai custom provider di 9Router dengan dua cara:
+
+### Cara A: Melalui GUI Web UI 9Router
+
+1. Buka Web UI 9Router (misal: `http://localhost:20128`).
+2. Masuk ke menu **Providers** -> Klik **Add Provider**.
+3. Pilih **OpenAI Compatible**:
+   - **Provider Name**: `Freebuff`
+   - **Base URL**: 
+     - Jika VPS/Docker: `http://127.0.0.1:8787/v1`
+     - Jika Cloudflare Worker: `https://freebuff2api.<your-subdomain>.workers.dev/v1`
+   - **API Key**: `freebuff-default-key` (sesuai yang diset di env/wrangler)
+   - **Prefix**: `fb`
+4. Di bagian **Models**, tambahkan model-model berikut:
+   - `deepseek/deepseek-v4-flash`
+   - `claude-3-5-sonnet-20241022`
+   - `gpt-4o`
+5. Simpan. Model sekarang bisa diakses melalui 9Router dengan format: `fb/deepseek/deepseek-v4-flash`.
+
+---
+
+### Cara B: Otomatis via Script SQLite 9Router
+
+Jika Anda mengelola 9Router di server/VPS, Anda bisa mendaftarkan Freebuff2API langsung ke database 9Router (`~/.9router/db/data.sqlite`):
+
+```python
+import sqlite3, uuid, json
+
+DB_PATH = "/root/.9router/db/data.sqlite"
+db = sqlite3.connect(DB_PATH)
+
+# 1. Daftarkan Provider Node
+node_id = "openai-compatible-chat-" + uuid.uuid4().hex[:24]
+node_data = {
+    "prefix": "fb",
+    "apiType": "chat",
+    "baseUrl": "http://127.0.0.1:8787/v1" # atau URL Worker Cloudflare
+}
+db.execute("""
+INSERT INTO providerNodes(id, type, name, data, createdAt, updatedAt)
+VALUES (?, 'openai-compatible', 'Freebuff', ?, datetime('now'), datetime('now'))
+""", (node_id, json.dumps(node_data)))
+
+# 2. Daftarkan Connection / API Key
+conn_id = "conn-" + uuid.uuid4().hex[:24]
+conn_data = {
+    "apiKey": "freebuff-default-key",
+    "testStatus": "ok",
+    "providerSpecificData": {}
+}
+db.execute("""
+INSERT INTO providerConnections(id, provider, authType, name, priority, isActive, data, createdAt, updatedAt)
+VALUES (?, ?, 'apikey', 'Default Key', 1, 1, ?, datetime('now'), datetime('now'))
+""", (conn_id, node_id, json.dumps(conn_data)))
+
+# 3. (Opsional) Buat Model Combo Alias
+combos = [
+    ("deepseek-v4-flash", ["fb/deepseek/deepseek-v4-flash"]),
+    ("freebuff-claude", ["fb/claude-3-5-sonnet-20241022"])
+]
+for name, models in combos:
+    combo_id = "combo-" + uuid.uuid4().hex[:24]
+    db.execute("""
+    INSERT OR REPLACE INTO combos(id, name, kind, models, createdAt, updatedAt)
+    VALUES (?, ?, '', ?, datetime('now'), datetime('now'))
+    """, (combo_id, name, json.dumps(models)))
+
+db.commit()
+db.close()
+print("Berhasil menyambungkan Freebuff2API ke 9Router!")
+```
+
+---
+
+## 5. Contoh Pemanggilan API
 
 ### A. OpenAI Format (`/v1/chat/completions`)
 
@@ -195,7 +273,7 @@ curl https://freebuff2api.your-subdomain.workers.dev/v1/messages \
 
 ---
 
-## 5. Daftar Model yang Didukung
+## 6. Daftar Model yang Didukung
 
 - `deepseek/deepseek-v4-flash` *(Default, sangat cepat & hemat kuota)*
 - `deepseek/deepseek-chat`
