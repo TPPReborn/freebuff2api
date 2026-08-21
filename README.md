@@ -88,7 +88,47 @@ Mode ini adalah cara paling mudah, cepat, dan **tidak membutuhkan VPS atau relay
    ```
 
 4. Selesai! Endpoint Anda sekarang siap digunakan:
-   `https://freebuff2api.<your-subdomain>.workers.dev/v1/chat/completions`
+   - Chat Endpoint: `https://freebuff2api.<your-subdomain>.workers.dev/v1/chat/completions`
+   - Cek Status & AccessTier Akun: `https://freebuff2api.<your-subdomain>.workers.dev/v1/accounts`
+
+---
+
+## 2. Cara Cek Status & AccessTier Akun
+
+Freebuff2API menyediakan endpoint khusus untuk melihat status seluruh akun, `accessTier` (`full` / `standard`), dan limit kuota:
+
+```bash
+curl https://freebuff2api.<your-subdomain>.workers.dev/v1/accounts \
+  -H "Authorization: Bearer freebuff-default-key"
+```
+
+**Contoh Response JSON:**
+```json
+{
+  "summary": {
+    "total_accounts": 10,
+    "full_tier_accounts": 10,
+    "active_rate_limited": 0
+  },
+  "accounts": [
+    {
+      "slot": "1/10",
+      "token": "76b8300d...e9c6",
+      "accessTier": "full",
+      "status": "active",
+      "pool": "Premium",
+      "rateLimit": {
+        "model": "deepseek/deepseek-v4-flash",
+        "limit": 5,
+        "pool": "premium",
+        "poolLabel": "Premium"
+      },
+      "inCooldown": false,
+      "cooldownRemainingSeconds": 0
+    }
+  ]
+}
+```
 
 ---
 
