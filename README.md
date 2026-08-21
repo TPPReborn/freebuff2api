@@ -176,8 +176,22 @@ Freebuff2API menyertakan script harvester otomatis berbasis **Playwright** yang 
    ```
 
 3. Jalankan automated harvester:
+   
+   **A. Mode Standar (Simpan ke JSON credentials):**
    ```bash
    python3 harvest_accounts.py --file accounts.txt --out ../credentials
+   ```
+
+   **B. Mode Auto-Sync ke Cloudflare Workers (Wrangler):**
+   ```bash
+   # Otomatis update FREEBUFF_TOKEN di wrangler.toml & deploy langsung ke Cloudflare:
+   python3 harvest_accounts.py --file accounts.txt --deploy-wrangler
+   ```
+
+   **C. Mode Auto-Reload Docker Container:**
+   ```bash
+   # Otomatis restart container Docker setelah selesai panen:
+   python3 harvest_accounts.py --file accounts.txt --reload-docker
    ```
 
 4. Cek validitas dan status `accessTier: full` akun:
