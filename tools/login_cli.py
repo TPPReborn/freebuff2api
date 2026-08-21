@@ -63,6 +63,30 @@ def open_url(url):
         pass
     return False
 
+def sync_to_wrangler(cred_dir, wrangler_path):
+    if not os.path.exists(wrangler_path): return
+    import glob, re
+    files = sorted(glob.glob(os.path.join(cred_dir, "*.json")))
+    tokens = []
+    for f in files:
+        try:
+            d = json.load(open(f))
+            t = d.get("authToken")
+            if t: tokens.append(t.strip())
+        except Exception: pass
+    if not tokens: return
+    print(f"\n[SYNC] Menyinkronkan {len(tokens)} token ke wrangler.toml...")
+    content = open(wrangler_path).read()
+    tokens_formatted = '"""\n' + "\n".join(tokens) + '\n"""'
+    pattern = r'FREEBUFF_TOKEN\s*=\s*(?:"""[\s\S]*?"""|"[^"]*")'
+    new_entry = f'FREEBUFF_TOKEN = {tokens_formatted}'
+    if re.search(pattern, content):
+        content = re.sub(pattern, new_entry, content)
+    else:
+        content += f"\nFREEBUFF_TOKEN = {tokens_formatted}\n"
+    open(wrangler_path, 'w').write(content)
+    print("✅ wrangler.toml berhasil di-update dengan token terbaru!")
+
 def main():
     os.makedirs(CRED_DIR, exist_ok=True)
     fp = gen_fingerprint()
@@ -118,6 +142,9 @@ def main():
                 print(f"📧 Email: {email}")
                 print(f"🔑 Token: {token[:16]}... (tersimpan di {out_file})")
                 print("==========================================")
+
+                wrangler_path = os.path.join(os.path.dirname(__file__), '../wrangler.toml')
+                sync_to_wrangler(CRED_DIR, wrangler_path)
                 return
 
         time.sleep(2)

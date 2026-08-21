@@ -6,6 +6,8 @@
   "scripts": {
     "start": "node server.js",
     "login": "node tools/login_cli.js",
+    "sync-wrangler": "node tools/sync_wrangler.js",
+    "deploy-wrangler": "node tools/sync_wrangler.js --deploy",
     "test": "node -e 'console.log(\"OK\")'"
   },
   "keywords": [

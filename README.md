@@ -210,11 +210,25 @@ python3 tools/login_cli.py
 **Alur Kerja:**
 1. Script menampilkan link login dan otomatis membuka browser di HP Anda (via `termux-open-url`).
 2. Anda cukup klik **Continue with Google** dan login seperti biasa di Chrome HP.
-3. Begitu selesai di browser, script di Termux langsung menangkap `authToken` dan menyimpannya ke `credentials/<email>.json`.
+3. Begitu selesai di browser, script di Termux langsung menangkap `authToken` dan menyimpannya ke `credentials/<email>.json` **sekaligus otomatis menyinkronkannya ke `wrangler.toml`**!
 
 ---
 
-### Cara B: Automated Playwright Harvester (Multi-Akun Batch)
+### Cara B: Sinkronisasi Token ke `wrangler.toml` Kapan Saja
+
+Jika Anda sudah memiliki file credential JSON di folder `./credentials/` dan ingin memindahkannya ke `wrangler.toml`:
+
+```bash
+# Sinkronkan token dari credentials/ ke wrangler.toml:
+npm run sync-wrangler
+
+# Atau sinkronkan sekaligus langsung deploy ke Cloudflare Workers:
+npm run deploy-wrangler
+```
+
+---
+
+### Cara C: Automated Playwright Harvester (Multi-Akun Batch)
 
 Cocok untuk VPS / Komputer dengan banyak akun:
 

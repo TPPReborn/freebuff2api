@@ -11,11 +11,7 @@ FREEBUFF_DEBUG = "false"
 
 # Daftarkan token akun Codebuff/Freebuff di sini
 # Format multi-token: pisahkan dengan baris baru (newline) atau koma
-# Contoh:
-# FREEBUFF_TOKEN = """
-# token_1_disini
-# token_2_disini
-# """
+# Bisa otomatis terisi via 'npm run sync-wrangler' atau 'npm run login'
 FREEBUFF_TOKEN = ""
 
 # Note: Jika di-deploy langsung ke Cloudflare Workers (mode Standalone/Direct),

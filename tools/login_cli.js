@@ -1,7 +1,8 @@
 #!/usr/bin/env node
 /**
- * Zero-dependency CLI Login for Freebuff / Codebuff
+ * Zero-dependency CLI Login for Freebuff / Codebuff (Termux & Native Friendly)
  * Works out of the box in Node.js on Termux Android, Windows, Mac, and Linux!
+ * Automatically syncs token to credentials/*.json and wrangler.toml
  */
 
 const https = require('https');
@@ -9,8 +10,10 @@ const fs = require('fs');
 const path = require('path');
 const crypto = require('crypto');
 const { exec } = require('child_process');
+const { syncWrangler } = require('./sync_wrangler');
 
 const CRED_DIR = path.resolve(__dirname, '../credentials');
+const WRANGLER_PATH = path.resolve(__dirname, '../wrangler.toml');
 
 function genFingerprint() {
   return 'codebuff-cli-' + crypto.randomBytes(4).toString('hex');
@@ -60,11 +63,14 @@ function openBrowser(url) {
 }
 
 async function main() {
+  const args = process.argv.slice(2);
+  const autoDeploy = args.includes('--deploy') || args.includes('-d');
+
   if (!fs.existsSync(CRED_DIR)) fs.mkdirSync(CRED_DIR, { recursive: true });
 
   const fp = genFingerprint();
   console.log('==========================================');
-  console.log('🔑 Freebuff CLI Login (Termux & Pure Node)');
+  console.log('🔑 Freebuff CLI Login (Termux & Native)');
   console.log('==========================================');
   console.log('Menghubungkan ke Codebuff API...');
 
@@ -118,6 +124,9 @@ async function main() {
           console.log(`📧 Email: ${email}`);
           console.log(`🔑 Token: ${token.slice(0, 16)}... (tersimpan di credentials/${safeName}.json)`);
           console.log('==========================================');
+
+          // Otomatis sinkronkan ke wrangler.toml
+          syncWrangler(autoDeploy);
           return;
         }
       }
