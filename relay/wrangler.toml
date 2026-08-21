@@ -1,0 +1,7 @@
+name = "freebuff-relay-us"
+main = "worker.js"
+compatibility_date = "2024-01-01"
+
+# Note: Egress Cloudflare Workers default keluar via US IP range.
+# Untuk multi-relay, deploy dengan nama berbeda seperti:
+# freebuff-relay-us1, freebuff-relay-us2

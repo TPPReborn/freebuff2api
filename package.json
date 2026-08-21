@@ -1,0 +1,21 @@
+{
+  "name": "freebuff2api",
+  "version": "1.0.0",
+  "description": "High-performance OpenAI and Anthropic compatible API gateway for Freebuff/Codebuff with US relay proxy, multi-account rotation, and rate-limit guard",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node -e 'console.log(\"OK\")'"
+  },
+  "keywords": [
+    "codebuff",
+    "freebuff",
+    "openai-api",
+    "anthropic-api",
+    "ai-gateway",
+    "proxy"
+  ],
+  "author": "TPPReborn",
+  "license": "MIT",
+  "dependencies": {}
+}

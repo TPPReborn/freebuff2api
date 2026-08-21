@@ -1,0 +1,2234 @@
+let CODEBUFF_API = "https://www.codebuff.com";
+let RELAY_URL = "";
+const DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
+const DEFAULT_API_KEY = "freebuff-default-key";
+const VERSION = "1.8.9";
+const CONTEXT_PRUNER_AGENT = "context-pruner";
+
+// Dynamic model registry: fetches model list from the official freebuff mirror
+// True source: https://github.com/CodebuffAI/freebuff (public mirror of freebuff-private)
+// Same origin as Freebuff Desktop 0.0.51 orchestrator.js FREEBUFF_ROOT_AGENT_ID_BY_MODEL
+// (mirror constants = same source as desktop; the installer is just a compiled artifact)
+// Requires 3 sources (constants spread across files):
+//   1. free-agents.ts       → FREEBUFF_ROOT_AGENT_ID_BY_MODEL（model→agent mapping）
+//   2. freebuff-models.ts   → most model ID constants + pool definitions (PREMIUM/GLM)
+//   3. freebuff-model-ids.ts→ deepseek/m3 ID constants (re-exported by models.ts)
+// Each source has a raw primary + jsDelivr fallback
+const DYNAMIC_MODELS_SOURCES = [
+  "https://raw.githubusercontent.com/CodebuffAI/freebuff/main/common/src/constants/free-agents.ts",
+  "https://cdn.jsdelivr.net/gh/CodebuffAI/freebuff@main/common/src/constants/free-agents.ts",
+];
+const DYNAMIC_MODELS_MODEL_IDS_SOURCES = [
+  "https://raw.githubusercontent.com/CodebuffAI/freebuff/main/common/src/constants/freebuff-models.ts",
+  "https://cdn.jsdelivr.net/gh/CodebuffAI/freebuff@main/common/src/constants/freebuff-models.ts",
+];
+const DYNAMIC_MODELS_STABLE_IDS_SOURCES = [
+  "https://raw.githubusercontent.com/CodebuffAI/freebuff/main/common/src/constants/freebuff-model-ids.ts",
+  "https://cdn.jsdelivr.net/gh/CodebuffAI/freebuff@main/common/src/constants/freebuff-model-ids.ts",
+];
+// Releases fallback: pre-parsed JSON generated daily by GitHub Actions (no parsing needed)
+// Used when all 3 official sources fail to fetch/parse. More stable than raw.githubusercontent (GitHub CDN).
+// Tested (2026-08-11): releases/latest/download URL returns HTTP 200, content is correct.
+const DYNAMIC_MODELS_RELEASE_SOURCES = [
+  "https://github.com/pingmike2/freebuff2api-wokers/releases/latest/download/freebuff-models.json",
+];
+// Refresh interval: aligned with Quorinex, 6 hours. Falls back to hardcoded MODELS on failure.
+const DYNAMIC_MODELS_REFRESH_MS = 6 * 60 * 60 * 1000;
+const DYNAMIC_MODELS_FETCH_TIMEOUT_MS = 10000;
+
+// Runtime dynamic model cache (in-memory, no KV store)
+let dynamicModelsCache = {
+  fetchedAt: 0,
+  models: null, // Dynamic model table (with categories)
+  pool: null, // { premium: Set, standard: Set, glm: Set }
+};
+
+// Parse model ID constants from freebuff-models.ts
+// Format:
+//   export const FREEBUFF_MIMO_V25_MODEL_ID = mimoModels.mimoV25
+//   export const FREEBUFF_MINIMAX_M3_MODEL_ID = 'minimax/minimax-m3'
+// Compatible with: 'string' | identifier.member (extract member name, look up in knownDefaults) | identifier
+function parseModelIdConstants(source) {
+  const table = {};
+  const knownDefaults = {
+    mimoV25: "mimo/mimo-v2.5",
+  };
+  // Match export const NAME = 'value' or export const NAME = expr
+  const re = /export\s+const\s+([A-Z0-9_]+)\s*=\s*(?:'([^']*)'|"([^"]*)"|([A-Za-z0-9_.]+))/g;
+  let m;
+  while ((m = re.exec(source)) !== null) {
+    const name = m[1];
+    const lit = m[2] ?? m[3] ?? "";
+    const expr = m[4] ?? "";
+    if (lit) table[name] = lit;
+    else if (expr) {
+      // identifier.member → extract member name (mimoModels.mimoV25 → mimoV25)
+      const member = expr.includes(".") ? expr.split(".").pop() : expr;
+      if (knownDefaults[member]) table[name] = knownDefaults[member];
+      else if (/^[a-zA-Z0-9_.-]+\/[a-zA-Z0-9_.:/-]+$/.test(expr)) table[name] = expr;
+    }
+  }
+  return table;
+}
+
+// Parse agent mappings from free-agents.ts, separated by purpose.
+// Do not merge base2 root, base3 root, and reviewer into one table: they belong to different execution paths.
+function parseAgentMappings(source, modelIdConstants) {
+  const blockNames = {
+    root: "FREEBUFF_ROOT_AGENT_ID_BY_MODEL",
+    base3: "FREEBUFF_WEB_BASE3_AGENT_ID_BY_MODEL",
+    reviewer: "FREEBUFF_REVIEWER_AGENT_ID_BY_MODEL",
+  };
+  const result = { root: {}, base3: {}, reviewer: {} };
+  const lineRe = /\[\s*([A-Z0-9_]+)\s*\]\s*:\s*'([^']+)'/g;
+  for (const [kind, blockName] of Object.entries(blockNames)) {
+    const blockRe = new RegExp(`${blockName}[^=]*=\\s*\\{([^}]*)\\}`);
+    const blockMatch = blockRe.exec(source);
+    if (!blockMatch) continue;
+    let m;
+    lineRe.lastIndex = 0;
+    while ((m = lineRe.exec(blockMatch[1])) !== null) {
+      const modelId = modelIdConstants[m[1]];
+      if (modelId) result[kind][modelId] = m[2];
+    }
+  }
+  return result;
+}
+
+// Compatible with: 'string' | identifier.member (extract member name, look up in knownDefaults) | identifier
+function parseAgentMapping(source, modelIdConstants) {
+  return parseAgentMappings(source, modelIdConstants).root;
+}
+
+// Parse pool definitions from freebuff-models.ts (PREMIUM / GLM; STANDARD derived from non-premium)
+// FREEBUFF_WEB_PREMIUM_MODEL_IDS includes spread(...FREEBUFF_PREMIUM_MODEL_IDS)
+function parseModelPools(source, modelIdConstants) {
+  const premium = new Set();
+  const glm = new Set();
+  const used = new Set();
+  // Expand spread: ...FOO → entries in FOO (constant name → value)
+  const constValues = new Map();
+  const constListRe = /export\s+const\s+([A-Z0-9_]+)\s*=\s*\[([^\]]*)\]\s*as\s*const/g;
+  let cm;
+  while ((cm = constListRe.exec(source)) !== null) {
+    const name = cm[1];
+    const items = [];
+    const itemRe = /\.\.\.([A-Z0-9_]+)|'([^']*)'|"([^"]*)"|([A-Za-z0-9_]+)/g;
+    let im;
+    while ((im = itemRe.exec(cm[2])) !== null) {
+      const spread = im[1];
+      const lit = im[2] ?? im[3];
+      const expr = im[4];
+      if (spread) items.push(["spread", spread]);
+      else if (lit) items.push(["lit", lit]);
+      else if (expr && modelIdConstants[expr]) items.push(["lit", modelIdConstants[expr]]);
+    }
+    constValues.set(name, items);
+  }
+  // Parse pools
+  const poolRe = /export\s+const\s+(FREEBUFF_WEB_PREMIUM_MODEL_IDS|FREEBUFF_GLM_V52_MODEL_IDS|FREEBUFF_PREMIUM_MODEL_IDS)\s*=\s*\[([^\]]*)\]/g;
+  let pm;
+  while ((pm = poolRe.exec(source)) !== null) {
+    const poolName = pm[1];
+    const items = [];
+    const itemRe = /\.\.\.([A-Z0-9_]+)|'([^']*)'|"([^"]*)"|([A-Za-z0-9_]+)/g;
+    let im;
+    while ((im = itemRe.exec(pm[2])) !== null) {
+      const spread = im[1];
+      const lit = im[2] ?? im[3];
+      const expr = im[4];
+      if (spread) {
+        // Recursively expand spread constant
+        const expand = (n) => {
+          const entries = constValues.get(n) || [];
+          for (const [kind, val] of entries) {
+            if (kind === "spread") expand(val);
+            else items.push(val);
+          }
+        };
+        expand(spread);
+      } else if (lit) items.push(lit);
+      else if (expr && modelIdConstants[expr]) items.push(modelIdConstants[expr]);
+    }
+    if (poolName === "FREEBUFF_GLM_V52_MODEL_IDS") {
+      for (const id of items) glm.add(id);
+    } else {
+      for (const id of items) premium.add(id);
+    }
+  }
+  // Both FREEBUFF_PREMIUM_MODEL_IDS and FREEBUFF_WEB_PREMIUM_MODEL_IDS count as premium
+  return { premium: [...premium], glm: [...glm] };
+}
+
+// Dynamic model table: records root, base3 root, and reviewer separately.
+function buildDynamicModelTable(agentMappings) {
+  // Compatible with: 'string' | identifier.member (extract member name, look up in knownDefaults) | identifier
+  const mappings = agentMappings && agentMappings.root
+    ? agentMappings
+    : { root: agentMappings || {}, base3: {}, reviewer: {} };
+  return Object.entries(mappings.root).map(([modelId, rootAgent]) => ({
+    id: modelId,
+    session: modelId,
+    // Old field kept as regular root; normal chat always uses it.
+    agent: rootAgent,
+    root_agent: rootAgent,
+    base3_agent: mappings.base3[modelId] || null,
+    reviewer_agent: mappings.reviewer[modelId] || null,
+    upstream: modelId,
+  }));
+}
+
+// Merge hardcoded and dynamic tables: hardcoded takes priority (no overwrite), new dynamic entries appended
+function mergeModelTables(hardcoded, dynamic) {
+  const seen = new Set(hardcoded.map((m) => m.id));
+  const merged = [...hardcoded];
+  for (const m of dynamic) {
+    if (!seen.has(m.id)) {
+      merged.push(m);
+      seen.add(m.id);
+    }
+  }
+  return merged;
+}
+
+// Fetch and refresh dynamic model cache (silently falls back on failure)
+async function fetchSourceList(urls) {
+  for (const url of urls) {
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), DYNAMIC_MODELS_FETCH_TIMEOUT_MS);
+      const resp = await fetch(url, { signal: ctrl.signal });
+      clearTimeout(timer);
+      if (resp.ok) {
+        const text = await resp.text();
+        // Relaxed threshold: freebuff-model-ids.ts is only ~491B (3 constants),
+        // a 500-byte threshold would falsely reject it. Only filter truly empty files (<100B).
+        if (text && text.length > 100) return text;
+      }
+    } catch {}
+  }
+  return null;
+}
+
+async function refreshDynamicModelsIfStale() {
+  const now = Date.now();
+  if (dynamicModelsCache.models && now - dynamicModelsCache.fetchedAt < DYNAMIC_MODELS_REFRESH_MS) {
+    return dynamicModelsCache;
+  }
+  // Fetch 3 sources in parallel (primary raw + jsDelivr fallback per source)
+  const [agentsSrc, modelsSrc, stableIdsSrc] = await Promise.all([
+    fetchSourceList(DYNAMIC_MODELS_SOURCES),
+    fetchSourceList(DYNAMIC_MODELS_MODEL_IDS_SOURCES),
+    fetchSourceList(DYNAMIC_MODELS_STABLE_IDS_SOURCES),
+  ]);
+  if (!agentsSrc || !modelsSrc) {
+    // Official sources failed: try Releases JSON fallback
+    const release = await tryReleaseFallback();
+    if (release) {
+      dynamicModelsCache = release;
+      return dynamicModelsCache;
+    }
+    // Releases also failed: keep old cache (if any), otherwise maintain current state
+    return dynamicModelsCache;
+  }
+  try {
+    // Merge constant tables: models.ts takes priority (complete), stableIds.ts supplements deepseek/m3
+    const modelIdConstants = { ...parseModelIdConstants(stableIdsSrc || ""), ...parseModelIdConstants(modelsSrc) };
+    const agentMappings = parseAgentMappings(agentsSrc, modelIdConstants);
+    if (Object.keys(agentMappings.root).length === 0) {
+      // Parse failed: try Releases fallback
+      const release = await tryReleaseFallback();
+      if (release) {
+        dynamicModelsCache = release;
+        return dynamicModelsCache;
+      }
+      return dynamicModelsCache;
+    }
+    const pools = parseModelPools(modelsSrc, modelIdConstants);
+    dynamicModelsCache = {
+      fetchedAt: Date.now(),
+      models: buildDynamicModelTable(agentMappings),
+      pool: {
+        premium: new Set(pools.premium),
+        standard: null,
+        glm: new Set(pools.glm),
+      },
+    };
+  } catch {
+    // Parse crashed: try Releases fallback
+    const release = await tryReleaseFallback();
+    if (release) {
+      dynamicModelsCache = release;
+      return dynamicModelsCache;
+    }
+    // Keep old cache
+  }
+  return dynamicModelsCache;
+}
+
+// Releases JSON fallback: directly fetch pre-generated models.json, zero parsing cost
+async function tryReleaseFallback() {
+  for (const url of DYNAMIC_MODELS_RELEASE_SOURCES) {
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), DYNAMIC_MODELS_FETCH_TIMEOUT_MS);
+      const resp = await fetch(url, { signal: ctrl.signal });
+      clearTimeout(timer);
+      if (resp.ok) {
+        const json = await resp.json();
+        if (json && Array.isArray(json.models) && json.models.length > 0) {
+          return {
+            fetchedAt: Date.now(),
+            models: json.models,
+            pool: {
+              premium: new Set(json.pools?.premium ?? []),
+              standard: null,
+              glm: new Set(json.pools?.glm ?? []),
+            },
+          };
+        }
+      }
+    } catch {}
+  }
+  return null;
+}
+
+// Dynamic STANDARD = models in the dynamic table that are NOT in premium/glm pools
+function dynamicStandardModels() {
+  const cache = dynamicModelsCache;
+  if (!cache || !cache.models || !cache.pool) return new Set();
+  const premium = cache.pool.premium;
+  const glm = cache.pool.glm;
+  return new Set(cache.models.map((m) => m.id).filter((id) => !premium.has(id) && !glm.has(id)));
+}
+
+// Model pool category lookup: dynamic pool first, hardcoded fallback
+// Returns "premium" | "standard" | "glm" | null
+function modelPoolCategory(modelId) {
+  const dyn = dynamicModelsCache;
+  if (dyn && dyn.pool) {
+    if (dyn.pool.premium.has(modelId)) return "premium";
+    if (dyn.pool.glm.has(modelId)) return "glm";
+    if (dynamicStandardModels().has(modelId)) return "standard";
+  }
+  // Hardcoded fallback
+  if (PREMIUM_QUOTA_MODELS.has(modelId)) return "premium";
+  if (STANDARD_MODELS.has(modelId)) return "standard";
+  return null;
+}
+
+
+// model → session model name / upstream agentId / upstream chat model name
+// Only keep 1 hardcoded fallback (at least one available in extreme cases):
+//   - mimo/mimo-v2.5   STANDARD model
+// All other models are provided by dynamic fetch (official source → GitHub Releases JSON → this fallback)
+const MODELS = [
+  { id: "mimo/mimo-v2.5", session: "mimo/mimo-v2.5", agent: "base2-free-mimo", upstream: "mimo/mimo-v2.5" },
+];
+
+// ---------------------------------------------------------------------------
+// Quota pool notes (reverse-engineered from official freebuff-models.ts, verified 2026-08-10)
+//
+// Three official quota pools (all session counts, not token counts):
+//   1. PREMIUM pool: shared 6/day (FREEBUFF_PREMIUM_SESSION_LIMIT=6)
+//      m3 / v4-pro / luna / laguna-s-2.1 / muse-spark / greg-2
+//      （FREEBUFF_WEB_PREMIUM_MODEL_IDS）
+//   2. STANDARD pool: browser/Web 6/day
+//      (FREEBUFF_WEB_STANDARD_SESSION_LIMIT=6; = all non-premium models,
+//       i.e. Flash / MiMo 2.5. FREEBUFF_WEB_STANDARD_MODEL_IDS)
+//      ⚠️ Source comment: "The CLI keeps these models UNLIMITED; browser surfaces
+//      cap fresh sessions to deter automated project/session churn."
+//      → CLI protocol Flash is unlimited, but CLI has been blocked by upstream (free_mode_cli_required);
+//        Flash is also limited to 6/day under desktop/Web protocol
+//   3. GLM 5.2 pool: independent, referral-unlocked (not counted above)
+//
+// Desktop concurrency buckets (FREEBUFF_DESKTOP_SESSION_LIMITS, concurrency only, not quota):
+//   premium: 1 ← Premium models: 1 active session per user at a time
+//   unlimited: 3 ← Flash/MiMo: max 3 concurrent tabs per user
+//   limited access tier (no Premium): all models occupy 1 slot
+//   （occupiesFreebuffDesktopSlot / getFreebuffDesktopSessionBucket）
+//
+// For v1.7.0: single-account serial daily limit = Premium 6 + Flash 6 (07:00 UTC
+// Pacific day reset). Spreading across multiple accounts burns each account's quota simultaneously — concurrency cannot bypass the 6/day limit.
+// Quota pool is only used for account selection; it never changes the caller's requested model.
+// ---------------------------------------------------------------------------
+const PREMIUM_QUOTA_MODELS = new Set([
+  "deepseek/deepseek-v4-pro",
+  "openai/gpt-5.6-luna",
+  "minimax/minimax-m3",
+  "meta/muse-spark-1.2-contributor",
+]);
+const STANDARD_MODELS = new Set([
+  "deepseek/deepseek-v4-flash",
+  "mimo/mimo-v2.5",
+]);
+
+// ---------------------------------------------------------------------------
+// Desktop protocol constants (reverse-engineered from Freebuff Desktop orchestrator.js)
+// Desktop = multi-session mode (one instance per tab), distinct from CLI single-session.
+// ⚠️ Tested (2026-08-10): multi-session instances return 428 waiting_room_required on chat
+// (server chat gate does not recognize multi-session instances), so POST actually uses single-session but retains
+// pre-generated instance-id desktop signature. include-unused-rate-limits is the browser/
+// quota snapshot header used by the model selector — safe to include in GET probes.
+// ---------------------------------------------------------------------------
+const DESKTOP_INCLUDE_RATE_LIMITS = { "x-freebuff-include-unused-rate-limits": "1" };
+
+
+export default {
+  async fetch(request, env) {
+    // Read dynamic config from env (overrides hardcoded defaults)
+    if (env.CODEBUFF_API) CODEBUFF_API = env.CODEBUFF_API;
+    if (env.RELAY_URL) RELAY_URL = env.RELAY_URL;
+
+    const url = new URL(request.url);
+    if (request.method === "OPTIONS") return new Response(null, { status: 204, headers: corsHeaders() });
+
+    // health does not require auth: health checks/monitoring probes should not depend on API key
+    if (request.method === "GET" && url.pathname === "/health") {
+      // Health check reads the local snapshot from the Worker's most recent real request.
+      // Do not fan-out GET /session and /me upstream just because of a public probe; these requests
+      // produce extra behavior and may interfere with an ongoing session on the same account.
+      return jsonResponse({
+        status: "ok",
+        version: VERSION,
+        ...summarizeAccountHealth(parseAccounts(env), acctHealth),
+        health_source: "worker_cache",
+        time: new Date().toISOString(),
+      }, 200);
+    }
+
+    const key = getApiKey(request, env);
+    if (!key) {
+      if (url.pathname === "/v1/messages" || url.pathname === "/messages" || url.pathname === "/v1/messages/count_tokens" || url.pathname === "/messages/count_tokens") {
+        return anthropicError("Invalid API key", "authentication_error", 401);
+      }
+      return jsonResponse({ error: { message: "Invalid API key", type: "auth_error" } }, 401);
+    }
+
+    cleanCache();
+
+    if (request.method === "GET" && (url.pathname === "/v1/models" || url.pathname === "/models")) {
+      return await handleModels();
+    }
+    if (request.method === "POST" && (url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions")) {
+      return handleChat(request, env);
+    }
+    if (request.method === "POST" && (url.pathname === "/v1/responses" || url.pathname === "/responses")) {
+      return handleResponses(request, env);
+    }
+    if (request.method === "POST" && (url.pathname === "/v1/messages/count_tokens" || url.pathname === "/messages/count_tokens")) {
+      return handleAnthropicCountTokens(request, env);
+    }
+    if (request.method === "POST" && (url.pathname === "/v1/messages" || url.pathname === "/messages")) {
+      return handleAnthropicMessages(request, env);
+    }
+    return jsonResponse({ error: { message: "Not found", type: "not_found" } }, 404);
+  },
+};
+
+// ---------------------------------------------------------------------------
+// Account pool
+// ---------------------------------------------------------------------------
+
+let accountIdx = 0;
+const cooldowns = new Map();      // token -> cooldown expiry ms
+const sessCache = new Map();      // `${token}`:${sessionModel}` -> { instanceId, model, remainingMs, expiresAt } (token-prefixed to prevent cross-account mixing)
+
+
+function parseAccounts(env) {
+  // Supports one per line (newline) or comma-separated; each entry can be a plain token or "token:uid" (colon-separated user_id)
+  // e.g. "t1\nt2:u2\nt3,u4:u4" → [{token:t1,uid:null},{token:t2,uid:u2},...]
+  return (env.FREEBUFF_TOKEN || "").split(/[\n,]/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 8)
+    .map((s) => {
+      const idx = s.indexOf(":");
+      if (idx > 0) return { token: s.slice(0, idx).trim(), uid: s.slice(idx + 1).trim() || null };
+      return { token: s, uid: null };
+    })
+    .filter((a) => a.token.length > 8);
+}
+
+// ---------------------------------------------------------------------------
+// Account health probe (v1.6.0): GET /api/v1/me does not consume session/quota, probes token validity and auto-discovers uid
+// ---------------------------------------------------------------------------
+
+const acctHealth = new Map(); // token -> { alive, state, uid, quota, checkedAt }
+const HEALTH_OBSERVATION_TTL_MS = 10 * 60 * 1000;
+
+// Only record upstream results observed by real business requests. Do not proactively probe in health,
+// and do not mistake network errors/unknown responses as account failures.
+function recordAccountObservation(token, status, dataOrText, extra = {}) {
+  if (!token) return;
+  let data = dataOrText;
+  if (typeof dataOrText === "string") {
+    try { data = JSON.parse(dataOrText); } catch { data = null; }
+  }
+  const upstreamState = data && typeof data === "object" ? data.status || data.state : null;
+  let state = null;
+  if (status === 404) state = "ok";
+  else if (["banned", "country_blocked", "rate_limited", "model_locked", "ip_capped"].includes(upstreamState)) state = upstreamState;
+  else if (status >= 200 && status < 300) state = "ok";
+  else if (status === 401) state = "token_invalid";
+  else if (status === 403) {
+    state = upstreamState === "banned"
+      ? "banned"
+      : upstreamState === "country_blocked" ? "country_blocked" : "blocked";
+  } else if (status === 429) state = "rate_limited";
+  if (!state) return;
+
+  const previous = acctHealth.get(token) || {};
+  acctHealth.set(token, {
+    ...previous,
+    ...extra,
+    alive: state === "ok",
+    state,
+    uid: extra.uid || previous.uid || null,
+    quota: extra.quota || previous.quota || null,
+    retryAfterMs: typeof extra.retryAfterMs === "number" ? extra.retryAfterMs : previous.retryAfterMs || null,
+    checkedAt: Date.now(),
+  });
+}
+
+function summarizeAccountHealth(pool, health) {
+  const account_details = pool.map((acct) => {
+    const info = health.get(acct.token);
+    return {
+      token: acct.token.slice(0, 8) + "...",
+      alive: info ? info.alive : null,
+      state: info?.state || "unknown",
+      uid: info?.uid ? info.uid.slice(0, 8) + "..." : null,
+    };
+  });
+  const account_states = {};
+  for (const detail of account_details) {
+    account_states[detail.state] = (account_states[detail.state] || 0) + 1;
+  }
+  const alive_accounts = account_details.filter((p) => p.alive === true).length;
+  const unknown_accounts = account_details.filter((p) => p.alive === null).length;
+  const unhealthy_accounts = account_details.filter((p) => p.alive === false).length;
+  const status = pool.length === 0
+    ? "critical"
+    : alive_accounts === 0 && (unhealthy_accounts > 0 || unknown_accounts > 0)
+      ? "critical"
+      : unhealthy_accounts > 0 || unknown_accounts > 0
+        ? "degraded"
+        : "ok";
+  return {
+    status,
+    accounts: pool.length,
+    alive_accounts,
+    unknown_accounts,
+    account_states,
+    account_details,
+  };
+}
+
+function pickToken(env, sessionModel) {
+  const pool = parseAccounts(env);
+  if (pool.length === 0) return null;
+
+  // v1.6.0: skip accounts probed as dead (alive=false); do not skip unprobed/failed probes (avoid false positives)
+  const alivePool = pool.filter((acct) => {
+    const h = acctHealth.get(acct.token);
+    return !(h && h.alive === false);
+  });
+  const usePool = alivePool.length > 0 ? alivePool : pool; // fall back to full pool when all dead; let 429 cooldown handle it
+
+  // v1.8.5.1: account selection restored to stable round-robin.
+  // rateLimitsByModel is observation-only, does not affect round-robin order; real session/chat
+  // only triggers cooldown skip after receiving explicit rate limits. This prevents stale snapshots from
+  // hijacking the round-robin or reordering accounts by "most remaining quota first".
+  const finalPool = usePool;
+
+  // Prefer accounts with active session caches: a session lasts ~1 hour, quota is deducted only on session creation
+  // Free quota (e.g., v4-pro 6/day). Pure round-robin would switch accounts and create a session per request,
+  // wasting session creation quota. Stick to the same account while the session cache is active; switch only when exhausted.
+  if (sessionModel) {
+    for (const acct of finalPool) {
+      const t = acct.token;
+      if (cooldowns.has(t) && cooldowns.get(t) > Date.now()) continue;
+      const cached = sessCache.get(t + ":" + sessionModel);
+      if (isUsableSession(cached)) {
+        return acct;
+      }
+    }
+  }
+
+  // Only round-robin when no active cache exists (skip cooldown accounts)
+  for (let k = 0; k < finalPool.length; k++) {
+    const acct = finalPool[accountIdx % finalPool.length];
+    accountIdx = (accountIdx + 1) % finalPool.length;
+    const t = acct.token;
+    if (!cooldowns.has(t) || cooldowns.get(t) <= Date.now()) return acct;
+  }
+  const oldest = [...cooldowns.entries()].sort((a, b) => a[1] - b[1])[0];
+  if (oldest) cooldowns.delete(oldest[0]);
+  return finalPool[0];
+}
+
+function normalizeSession(data, requestedModel, now = Date.now()) {
+  const expiryMs = Date.parse(data?.expiresAt || "");
+  const remaining = Number(data?.remainingMs);
+  const effectiveExpiry = Number.isFinite(expiryMs)
+    ? expiryMs
+    : (Number.isFinite(remaining) ? now + Math.max(0, remaining) : NaN);
+  return {
+    model: data?.model || requestedModel,
+    instanceId: data?.instanceId || null,
+    remainingMs: Number.isFinite(effectiveExpiry) ? Math.max(0, effectiveExpiry - now) : null,
+    expiresAt: Number.isFinite(effectiveExpiry) ? new Date(effectiveExpiry).toISOString() : null,
+  };
+}
+
+function isUsableSession(session, now = Date.now()) {
+  const expiryMs = Date.parse(session?.expiresAt || "");
+  return Boolean(session?.instanceId) && Number.isFinite(expiryMs) && expiryMs > now + 60000;
+}
+
+function accountSlot(pool, token) {
+  const index = pool.findIndex((acct) => acct.token === token);
+  return index >= 0 ? `${index + 1}/${pool.length}` : `?/${pool.length}`;
+}
+
+function logAccountRoute(enabled, pool, token, model, attempt, reason) {
+  if (!enabled) return;
+  try {
+    console.log(JSON.stringify({ event: "account_route", model, account_slot: accountSlot(pool, token), attempt, reason }));
+  } catch {}
+}
+
+function cooldown(token, ms) {
+  if (ms > 0) cooldowns.set(token, Date.now() + ms);
+}
+
+// Official Freebuff session-gate recovery requires matching both the HTTP
+// status and the relayed error code. Do not treat session_limit_reached or
+// waiting_room_queued as stale sessions: those states must not delete a live
+// session or burn another session slot.
+const SESSION_GATE_RECOVERY = {
+  waiting_room_required: 428,
+  session_expired: 410,
+  session_superseded: 409,
+  session_model_mismatch: 409,
+};
+
+function hasExactErrorCode(value, expected) {
+  if (value === expected) return true;
+  if (!value || typeof value !== "object") return false;
+  return Object.values(value).some((entry) => hasExactErrorCode(entry, expected));
+}
+
+function isStaleSessionGate(status, body) {
+  let parsed = null;
+  try { parsed = JSON.parse(body); } catch {}
+  return Object.entries(SESSION_GATE_RECOVERY).some(([code, expectedStatus]) =>
+    status === expectedStatus && hasExactErrorCode(parsed, code));
+}
+
+// Only used to confirm Premium quota exhaustion when streaming has no initial data; does not affect account round-robin ordering.
+function remainingQuota(token, sessionModel) {
+  if (modelPoolCategory(sessionModel) === "standard") return null;
+  const h = acctHealth.get(token);
+  if (!h || !h.quota) return null;
+  let entry = h.quota[sessionModel];
+  if (!entry && modelPoolCategory(sessionModel) === "premium") {
+    const premiumPool = (dynamicModelsCache.pool && dynamicModelsCache.pool.premium)
+      ? dynamicModelsCache.pool.premium
+      : PREMIUM_QUOTA_MODELS;
+    for (const model of premiumPool) {
+      if (h.quota[model]) {
+        entry = h.quota[model];
+        break;
+      }
+    }
+  }
+  if (!entry || typeof entry.recentCount !== "number" || typeof entry.limit !== "number") return null;
+  return entry.limit - entry.recentCount;
+}
+
+// Long streams should not be killed by a fixed timeout: only when upstream quota probing explicitly indicates exhaustion,
+// allow the current request to abort and switch accounts. Failed probes or unknown quota never trigger exhaustion.
+function isQuotaExhausted(info, sessionModel) {
+  if (!info) return false;
+  if (["rate_limited", "banned", "country_blocked", "token_invalid", "blocked", "model_locked", "ip_capped"].includes(info.state)) return true;
+  // STANDARD has no reliable remaining quota query; only handle explicit account/upstream states,
+  // do not determine exhaustion from STANDARD rateLimitsByModel numbers.
+  if (modelPoolCategory(sessionModel) === "standard") return false;
+  if (!info.quota) return false;
+  let entry = info.quota[sessionModel];
+  if (!entry && modelPoolCategory(sessionModel) === "premium") {
+    const premiumPool = (dynamicModelsCache.pool && dynamicModelsCache.pool.premium)
+      ? dynamicModelsCache.pool.premium
+      : PREMIUM_QUOTA_MODELS;
+    for (const model of premiumPool) {
+      if (info.quota[model]) { entry = info.quota[model]; break; }
+    }
+  }
+  if (!entry || typeof entry.recentCount !== "number" || typeof entry.limit !== "number") return false;
+  return entry.limit - entry.recentCount <= 0;
+}
+
+function parseCooldown(text, status, headers) {
+  // 1. Check Retry-After header if provided
+  if (headers) {
+    const ra = headers.get ? headers.get("retry-after") : headers["retry-after"];
+    if (ra) {
+      const sec = parseInt(ra, 10);
+      if (!isNaN(sec) && sec > 0) return Math.min(sec * 1000, 24 * 3600 * 1000);
+      const d = Date.parse(ra);
+      if (!isNaN(d) && d > Date.now()) return Math.min(d - Date.now(), 24 * 3600 * 1000);
+    }
+  }
+
+  // 2. Prefer retryAfterMs / resetsAt from JSON response
+  const jm = (text || "").match(/"retryAfterMs"\s*:\s*(\d+)/i);
+  if (jm) {
+    const ms = parseInt(jm[1], 10);
+    if (ms > 0) return Math.min(ms, 24 * 3600 * 1000);
+  }
+
+  const rm = (text || "").match(/"resetsAt"\s*:\s*"?([^",\s\}]+)"?/i);
+  if (rm) {
+    const d = Date.parse(rm[1]);
+    if (!isNaN(d) && d > Date.now()) return Math.min(d - Date.now(), 24 * 3600 * 1000);
+  }
+
+  // 3. Human readable text: "try again in Xh Ym Zs" or "resets in Xm"
+  const m = (text || "").match(/(?:try again in|resets? in|wait)\s+(?:(\d+)\s*h)?\s*(?:(\d+)\s*m)?\s*(?:(\d+)\s*s)?/i);
+  if (m && (m[1] || m[2] || m[3])) {
+    const ms = (parseInt(m[1]||0,10)*3600 + parseInt(m[2]||0,10)*60 + parseInt(m[3]||0,10)) * 1000;
+    if (ms > 0) return Math.min(ms, 24 * 3600 * 1000);
+  }
+
+  // 4. Default 429 cooldown: minimal 15 menit agar tidak spam session
+  return status === 429 ? 15 * 60 * 1000 : 60 * 1000;
+}
+
+class QuotaExhaustedError extends Error {
+  constructor(info) {
+    super("upstream account quota exhausted");
+    this.name = "QuotaExhaustedError";
+    this.retryAfterMs = info && typeof info.retryAfterMs === "number" ? info.retryAfterMs : null;
+  }
+}
+
+class EmptyUpstreamStreamError extends Error {
+  constructor() {
+    super("upstream returned an empty stream");
+    this.name = "EmptyUpstreamStreamError";
+  }
+}
+
+function invalidateSessionCache(token) {
+  const prefix = token + ":";
+  for (const key of sessCache.keys()) {
+    if (key.startsWith(prefix)) sessCache.delete(key);
+  }
+}
+
+async function deleteUpstreamSession(token, instanceId) {
+  invalidateSessionCache(token);
+  if (!instanceId) return;
+  try {
+    await enqueueUp("DELETE", "/api/v1/freebuff/session", token, undefined,
+      { "x-freebuff-instance-id": instanceId }, SESSION_TIMEOUT_MS);
+  } catch {}
+}
+
+// ---------------------------------------------------------------------------
+// Upstream requests (serial queue; free-tier concurrency >1 causes issues)
+// ---------------------------------------------------------------------------
+
+let chainTail = Promise.resolve();
+const CHAIN_GAP_MS = 300; // free-tier concurrency >1 causes issues; serial + gap; 300ms debounce keeps total latency manageable
+function sleep(ms) { return new Promise((r) => setTimeout(r, ms)); }
+
+function enqueue(fn) {
+  const run = chainTail.then(() => sleep(CHAIN_GAP_MS)).then(fn);
+  chainTail = run.catch(() => {});
+  return run;
+}
+
+const UPSTREAM_TIMEOUT_MS = 20000; // upstream single-request timeout, prevents client from waiting indefinitely
+const NONSTREAM_TIMEOUT_MS = 45000; // non-streaming needs to aggregate full upstream stream (including reasoning), gives more time
+const SESSION_TIMEOUT_MS = 10000;  // session/run short interactions fail faster
+// Not a streaming request failure timeout — only an observation window for triggering a quota probe when the first data is delayed.
+// Do not abort or switch accounts while quota is still available; keep waiting for upstream.
+const STREAM_NO_DATA_PROBE_DELAY_MS = 20000;
+
+let relayIdx = 0;
+function getRelayUrl() {
+  if (!RELAY_URL) return "";
+  const urls = RELAY_URL.split(",").map(u => u.trim()).filter(Boolean);
+  if (urls.length === 0) return "";
+  const selected = urls[relayIdx % urls.length];
+  relayIdx = (relayIdx + 1) % urls.length;
+  return selected;
+}
+
+// Resolve upstream URL: if RELAY_URL is set, route through relay (inject relay headers)
+function resolveUpstream(path, extraHeaders = {}) {
+  const currentRelay = getRelayUrl();
+  if (currentRelay) {
+    const relayHeaders = { ...extraHeaders };
+    relayHeaders["x-relay-target"] = CODEBUFF_API;
+    relayHeaders["x-relay-path"] = path;
+    return [currentRelay, relayHeaders];
+  }
+  return [CODEBUFF_API + path, extraHeaders];
+}
+
+// Resolve direct chat fetch URL (for streaming, which bypasses up())
+function resolveChatUrl(path, headers) {
+  const currentRelay = getRelayUrl();
+  if (currentRelay) {
+    const h = new Headers(headers);
+    h.set("x-relay-target", CODEBUFF_API);
+    h.set("x-relay-path", path);
+    return [currentRelay, h];
+  }
+  return [CODEBUFF_API + path, headers];
+}
+
+async function up(method, path, token, body, extraHeaders = {}, timeoutMs = UPSTREAM_TIMEOUT_MS) {
+  const headers = {};
+  // Desktop protocol: do not manually set User-Agent (fetch default), only carry necessary business headers
+  if (token) headers.Authorization = `Bearer ${token}`;
+  if (body !== undefined) headers["Content-Type"] = "application/json";
+  Object.assign(headers, extraHeaders);
+
+  const [fetchUrl, finalHeaders] = resolveUpstream(path, { ...headers });
+  const resp = await fetch(fetchUrl, {
+    method,
+    headers: finalHeaders,
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+    signal: AbortSignal.timeout(timeoutMs),
+  });
+  const text = await resp.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+  return { status: resp.status, data, text };
+}
+
+function enqueueUp(method, path, token, body, extraHeaders, timeoutMs) {
+  return enqueue(() => up(method, path, token, body, extraHeaders, timeoutMs));
+}
+
+// Quota check when streaming has no initial data: read-only local cache, never hit upstream.
+// ⚠️ Cannot force-refresh here via GET /api/v1/freebuff/session:
+// This endpoint would occupy the account session, and Freebuff only allows one client online per account at a time,
+// Probing would disrupt an ongoing inference session (428 waiting_room_required). luna effort=high
+// Long-reasoning models may take >20s for the first token — probing would be a false positive.
+// Cache miss/expired/quota unknown → never declare exhaustion, keep waiting for upstream.
+async function freshQuotaProbe(token, sessionModel) {
+  const cached = acctHealth.get(token);
+  if (!cached) return;
+  if (Date.now() - cached.checkedAt > HEALTH_OBSERVATION_TTL_MS) return;
+  if (isQuotaExhausted(cached, sessionModel)) throw new QuotaExhaustedError(cached);
+}
+
+// Streaming chat does not set a total timeout abort. Only when the first data is delayed,
+// force-refresh account quota; if quota is unknown or still available, the original request keeps waiting.
+async function fetchStreamWithQuotaGuard(url, init, token, sessionModel) {
+  const controller = new AbortController();
+  const request = fetch(url, { ...init, signal: controller.signal });
+  let probeTimer = null;
+  const armProbe = () => new Promise((_, reject) => {
+    probeTimer = setTimeout(() => {
+      freshQuotaProbe(token, sessionModel).catch((error) => {
+        if (error instanceof QuotaExhaustedError) {
+          try { controller.abort(error); } catch { controller.abort(); }
+          reject(error);
+        }
+      });
+    }, STREAM_NO_DATA_PROBE_DELAY_MS);
+  });
+  const clearProbe = () => {
+    if (probeTimer !== null) clearTimeout(probeTimer);
+    probeTimer = null;
+  };
+  try {
+    // No longer use AbortSignal.timeout(20s) before the first byte.
+    const response = await Promise.race([request, armProbe()]);
+    clearProbe();
+    if (!response.body) throw new EmptyUpstreamStreamError();
+
+    const reader = response.body.getReader();
+    const first = await Promise.race([reader.read(), armProbe()]);
+    clearProbe();
+    if (first.done) {
+      try { reader.releaseLock(); } catch {}
+      throw new EmptyUpstreamStreamError();
+    }
+
+    // First chunk has arrived; hand off to normal SSE forwarding logic; no more fixed total timeout.
+    const body = new ReadableStream({
+      start(streamController) {
+        streamController.enqueue(first.value);
+        (async () => {
+          try {
+            while (true) {
+              const next = await reader.read();
+              if (next.done) break;
+              streamController.enqueue(next.value);
+            }
+            streamController.close();
+          } catch (error) {
+            streamController.error(error);
+          } finally {
+            try { reader.releaseLock(); } catch {}
+          }
+        })();
+      },
+      cancel(reason) { return reader.cancel(reason); },
+    });
+    return new Response(body, { status: response.status, headers: response.headers });
+  } catch (error) {
+    clearProbe();
+    try { controller.abort(error); } catch { controller.abort(); }
+    throw error;
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Session lifecycle
+// ---------------------------------------------------------------------------
+
+// ---------------------------------------------------------------------------
+// Normal client behavior layer (v1.8.8.1, based on: official cli/src/hooks/use-gravity-ad.ts,
+// cli/src/utils/fingerprint.ts、sdk/src/impl/llm.ts）
+//   - Stable fingerprint: one never-changing fingerprintId per Worker/account (enhanced- prefix,
+//     Official uses hardware serial/MAC/machine ID hash; CF has no hardware, derive stable hash from token,
+//     key principle: "same account always has the same fingerprint"）
+//   - Ad chain: official free inference is ad-supported (source comment), POST /ads before each session +
+//     POST /ads/impression for impression reporting, silently skipped on failure
+//   - Usage touch: the official client queries /api/v1/usage at startup — do the same for completeness
+// ---------------------------------------------------------------------------
+const BEHAVIOR_CACHE_TTL_MS = 30 * 60 * 1000; // 30 minutes
+const behaviorCache = new Map(); // key -> ts
+
+function behaviorDue(key) {
+  const ts = behaviorCache.get(key) || 0;
+  if (Date.now() - ts > BEHAVIOR_CACHE_TTL_MS) {
+    behaviorCache.set(key, Date.now());
+    return true;
+  }
+  return false;
+}
+
+// Stable fingerprint: derived from token, always consistent per account (official enhanced- prefix + hash)
+// CF Workers lack synchronous WebCrypto, use lightweight deterministic hash (FNV-1a dual seed + hex)
+function stableFingerprint(token) {
+  let h1 = 0x811c9dc5, h2 = 0x01000193;
+  const s = "freebuff-fp-v2:" + token;
+  for (let i = 0; i < s.length; i++) {
+    const c = s.charCodeAt(i);
+    h1 = Math.imul(h1 ^ c, 0x01000193) >>> 0;
+    h2 = Math.imul(h2 ^ c, 0x85ebca6b) >>> 0;
+  }
+  return "enhanced-" + h1.toString(16).padStart(8, "0") + h2.toString(16).padStart(8, "0");
+}
+
+// Ad chain: POST /ads to fetch → if impUrl exists, POST /ads/impression for impression reporting.
+// Official implementation: getCliAdRequestUserAgent sends Freebuff-CLI/<version> UA;
+// body {provider:"gravity", surface, sessionId, device, userAgent}; impression {impUrl, mode}
+async function runNormalClientBehavior(token, clientFingerprint) {
+  const failures = [];
+  // 1) Ad fetch + impression (every 30 min, avoid hitting ad API per request)
+  if (behaviorDue("ads:" + token)) {
+    try {
+      const ad = await enqueueUp("POST", "/api/v1/ads", token, {
+        provider: "gravity",
+        sessionId: crypto.randomUUID(),
+        surface: "waiting_room",
+        device: { os: "macos", timezone: "Asia/Shanghai", locale: "zh-CN" },
+        userAgent: "Freebuff-CLI/0.0.138",
+      }, { "User-Agent": "Freebuff-CLI/0.0.138", "Content-Type": "application/json" }, 6000);
+      const impUrl = ad.data && Array.isArray(ad.data.ads) && ad.data.ads[0] && ad.data.ads[0].impUrl;
+      if (ad.status === 200 && impUrl) {
+        await enqueueUp("POST", "/api/v1/ads/impression", token,
+          { impUrl, mode: "free" },
+          { "User-Agent": "Freebuff-CLI/0.0.138", "Content-Type": "application/json" }, 6000);
+      }
+    } catch (e) { failures.push("ads:" + String(e && e.message || e).slice(0, 80)); }
+  }
+  // 2) Usage touch (every 30 min)
+  if (behaviorDue("usage:" + token)) {
+    try {
+      await enqueueUp("POST", "/api/v1/usage", token,
+        { fingerprintId: clientFingerprint },
+        { "Content-Type": "application/json" }, 6000);
+    } catch (e) { failures.push("usage:" + String(e && e.message || e).slice(0, 80)); }
+  }
+  return failures;
+}
+
+async function createSession(token, sessionModel, forceCreate = false) {
+  // 0) Normal client behavior: ad chain + usage touch (30-minute throttle, silent failure)
+  try { await runNormalClientBehavior(token, stableFingerprint(token)); } catch {}
+  // 1) Cache hit and not expired (>60s remaining): reuse directly to avoid hitting upstream session API per request
+  if (!forceCreate) {
+    const cached = sessCache.get(token + ":" + sessionModel);
+    if (isUsableSession(cached)) {
+      return cached;
+    }
+    if (cached) sessCache.delete(token + ":" + sessionModel);
+  }
+  // 1) Check upstream current session, reuse if same model (skip on forceCreate: zombie active sessions get repeatedly reused by GET,
+  //    causing persistent 428 on chat; force POST for a fresh instance)
+  //    Desktop signature: GET with include-unused-rate-limits (model selector quota snapshot header)
+  if (!forceCreate) {
+    const cur = await enqueueUp("GET", "/api/v1/freebuff/session", token, undefined,
+      DESKTOP_INCLUDE_RATE_LIMITS, SESSION_TIMEOUT_MS);
+    recordAccountObservation(token, cur.status, cur.data, {
+      quota: cur.data?.rateLimitsByModel || null,
+      uid: cur.data?.uid || null,
+      retryAfterMs: cur.data?.retryAfterMs,
+    });
+    if (cur.status === 200 && cur.data?.status === "active" && cur.data?.instanceId) {
+      const cm = cur.data.model;
+      if (!cm || cm === sessionModel) {
+        const s = normalizeSession(cur.data, sessionModel);
+        sessCache.set(token + ":" + sessionModel, s);
+        return s;
+      }
+      await deleteUpstreamSession(token, cur.data.instanceId);
+    }
+  }
+
+
+  // 2) create (may queue). Desktop signature: POST with pre-generated x-freebuff-instance-id (client UUID).
+  //    ⚠️ Tested (2026-08-10): multi-session:1 instances return 428 waiting_room_required on chat
+  //    (server chat gate does not recognize multi-session instances), so we use single-session + pre-generated instance-id:
+  //    retains the desktop client pre-generated instance fingerprint while ensuring chat is recognized.
+  const instId = crypto.randomUUID();
+  const r = await enqueueUp("POST", "/api/v1/freebuff/session", token, undefined,
+    { "x-freebuff-model": sessionModel, "x-freebuff-instance-id": instId, "Content-Type": "application/json" }, SESSION_TIMEOUT_MS);
+  recordAccountObservation(token, r.status, r.data, {
+    quota: r.data?.rateLimitsByModel || null,
+    uid: r.data?.uid || null,
+    retryAfterMs: r.data?.retryAfterMs,
+  });
+  if (r.status === 200 && r.data?.status === "active" && r.data?.instanceId) {
+    const s = normalizeSession(r.data, sessionModel);
+    sessCache.set(token + ":" + sessionModel, s);
+    return s;
+  }
+  if (r.status === 200 && r.data?.status === "queued" && r.data?.instanceId) {
+    const inst = r.data.instanceId;
+    for (let i = 0; i < 8; i++) {
+      await sleep(1500);
+      const q = await enqueueUp("GET", "/api/v1/freebuff/session", token, undefined, { "x-freebuff-instance-id": inst }, SESSION_TIMEOUT_MS);
+      recordAccountObservation(token, q.status, q.data, {
+        quota: q.data?.rateLimitsByModel || null,
+        uid: q.data?.uid || null,
+        retryAfterMs: q.data?.retryAfterMs,
+      });
+      if (q.status === 200 && q.data?.status === "active") {
+        const s = normalizeSession({ ...q.data, instanceId: q.data.instanceId || inst }, sessionModel);
+        sessCache.set(token + ":" + sessionModel, s);
+        return s;
+      }
+    }
+    throw new Error("session stayed queued (retry later)");
+  }
+  if (r.status === 429 || (r.text || "").includes("spend_limited") || (r.text || "").includes("rate_limited")) {
+    const cdMs = parseCooldown(r.text || JSON.stringify(r.data), 429);
+    cooldown(token, cdMs);
+    throw new Error(`account_rate_limited: 429 (cooldown ${(cdMs/1000/60).toFixed(1)}m) ${r.text || ""}`);
+  }
+  if (r.status === 409) throw new Error("session_model_mismatch: " + String(r.data?.message || r.data?.error || "upstream rejected this model"));
+  throw new Error("create session failed: " + r.status + " " + (r.text || "").slice(0, 300));
+}
+
+// ---------------------------------------------------------------------------
+// Agent-runs lifecycle
+// ---------------------------------------------------------------------------
+
+function utcNow() {
+  return new Date().toISOString().replace(/\.\d+Z$/, "Z");
+}
+
+async function startRun(token, agentId, ancestors = []) {
+  const r = await enqueueUp("POST", "/api/v1/agent-runs", token,
+    { action: "START", agentId, ancestorRunIds: ancestors }, undefined, SESSION_TIMEOUT_MS);
+  if (r.status !== 200 || !r.data?.runId) throw new Error("start_run failed: " + r.status + " " + (r.text || "").slice(0, 200));
+  return r.data.runId;
+}
+
+async function recordStep(token, runId, stepNumber, startTime, children = [], messageId = null) {
+  await enqueueUp("POST", `/api/v1/agent-runs/${runId}/steps`, token,
+    { stepNumber, credits: 0, childRunIds: children, messageId, status: "completed", startTime }, undefined, SESSION_TIMEOUT_MS);
+}
+
+async function finishRun(token, runId, totalSteps) {
+  await enqueueUp("POST", "/api/v1/agent-runs", token,
+    { action: "FINISH", runId, status: "completed", totalSteps, directCredits: 0, totalCredits: 0 }, undefined, SESSION_TIMEOUT_MS);
+}
+
+// Direct models (deepseek, etc.): main run + context-pruner sub-run
+// Simplified: only START two runs (chat only validates run_id existence; recordStep/finishRun can be skipped),
+// Measured total chain latency under 4s (original 8s), meeting qwenpaw check_model_connection 5s timeout
+const runCache = new Map();   // `${token}:${agentId}` -> { runId, childRunId, ts }
+const RUN_CACHE_TTL_MS = 10 * 60 * 1000; // run_id is reusable across requests (upstream only validates existence); 10min cache saves two upstream calls
+
+async function startRunChain(token, agentId) {
+  const key = token + ":" + agentId;
+  const hit = runCache.get(key);
+  if (hit && Date.now() - hit.ts < RUN_CACHE_TTL_MS) {
+    return { runId: hit.runId, agentId, startedAt: utcNow(), childRunId: hit.childRunId, cached: true };
+  }
+  const startedAt = utcNow();
+  const runId = await startRun(token, agentId);
+  const childRunId = await startRun(token, CONTEXT_PRUNER_AGENT, [runId]);
+  runCache.set(key, { runId, childRunId, ts: Date.now() });
+  return { runId, agentId, startedAt, childRunId, cached: false };
+}
+
+// ---------------------------------------------------------------------------
+// Upstream payload construction (aligned with Python build_upstream_payload)
+// ---------------------------------------------------------------------------
+
+const UPSTREAM_KEYS = [
+  "frequency_penalty", "logit_bias", "logprobs", "max_completion_tokens", "max_tokens",
+  "metadata", "modalities", "parallel_tool_calls", "presence_penalty", "reasoning_effort",
+  "response_format", "seed", "service_tier", "stop", "store", "stream_options",
+  "temperature", "tool_choice", "tools", "top_logprobs", "top_p", "top_k", "user",
+];
+
+// Official free-mode marker requires system prompt to start with "You are Buffy, the strategic coding assistant."
+// byte-level opening (server hasFreebuffRootSystemPromptOpening check; the old `[System Override...]`
+// prefix bypass has been patched by upstream, returning 403 free_mode_cli_required).
+const BUFFY = "You are Buffy, the strategic coding assistant.";
+
+function normalizeMessages(messages) {
+  if (!Array.isArray(messages)) return [];
+  const out = [];
+  let hasSystem = false;
+  for (const m of messages) {
+    if (!m || typeof m !== "object") continue;
+    const item = { ...m };
+    if (item.role === "developer") item.role = "system";
+    if (item.role === "system") {
+      hasSystem = true;
+      item.cache_control = { type: "ephemeral" };
+      // Inject the official Buffy prefix (server hasFreebuffRootSystemPromptOpening byte-level check).
+      // Both string and array (content as [{type:'text',text}], common in OpenAI SDK) must be handled.
+      if (typeof item.content === "string") {
+        if (!item.content.startsWith(BUFFY)) item.content = BUFFY + item.content;
+      } else if (Array.isArray(item.content)) {
+        const firstText = item.content.find((c) => c && c.type === "text" && typeof c.text === "string");
+        if (firstText && !firstText.text.startsWith(BUFFY)) firstText.text = BUFFY + firstText.text;
+      }
+    }
+    out.push(item);
+  }
+  if (!hasSystem) out.unshift({ role: "system", content: BUFFY, cache_control: { type: "ephemeral" } });
+  return out;
+}
+
+// Official model reasoning effort limits (2026-08-12 source: freebuff-models.ts / reasoning-effort.ts)
+// Models only allow effort levels in their efforts array; when the requested level exceeds the limit, clamp down to the nearest available level,
+// without rejecting the request or switching models (official clampReasoningEffort semantics).
+// Effort level ascending ladder: minimal < low < medium < high < xhigh < max < ultra
+const REASONING_EFFORT_RANK = ["minimal", "low", "medium", "high", "xhigh", "max", "ultra"];
+
+// Official per-model efforts:
+//   - deepseek-v4-flash: [low, high, max] (no medium)
+//   - deepseek-v4-pro:   [high, max]
+//   - gpt-5.6-luna:      EFFORTS_THROUGH_MAX（low..max）
+//   - muse-spark:        EFFORTS_THROUGH_XHIGH（low..xhigh，ALWAYS reasons，none=400）
+//   - minimax-m3:        no effort (official adaptive/disabled thinking, no levels set)
+//   - Unlisted models: no limits, pass through as-is
+const MODEL_EFFORTS = {
+  "deepseek/deepseek-v4-flash": ["low", "high", "max"],
+  "deepseek/deepseek-v4-pro": ["high", "max"],
+  "openai/gpt-5.6-luna": ["low", "medium", "high", "max"],
+  "meta/muse-spark-1.2-contributor": ["low", "medium", "high", "xhigh"],
+};
+
+function clampReasoningEffort(requested, allowed) {
+  if (!Array.isArray(allowed) || allowed.length === 0) return requested;
+  const wanted = REASONING_EFFORT_RANK.indexOf(requested);
+  if (wanted < 0) return requested; // Unknown level → pass through as-is, let upstream handle it
+  let best = null;
+  let bestRank = -1;
+  for (const cand of allowed) {
+    const rank = REASONING_EFFORT_RANK.indexOf(cand);
+    if (rank < 0 || rank > wanted) continue;
+    if (rank > bestRank) { best = cand; bestRank = rank; }
+  }
+  if (best !== null) return best;
+  // All available levels are higher than requested → pick the lowest (official semantics)
+  return allowed.reduce((lo, c) =>
+    REASONING_EFFORT_RANK.indexOf(c) < REASONING_EFFORT_RANK.indexOf(lo) ? c : lo);
+}
+
+function normalizeReasoningEffort(model, effort) {
+  if (effort === undefined || effort === null) return effort;
+  const allowed = MODEL_EFFORTS[model];
+  if (!allowed) return effort; // Model not listed → no intervention
+  const clamped = clampReasoningEffort(String(effort), allowed);
+  return clamped === String(effort) ? effort : clamped;
+}
+
+function buildUpstreamPayload(params, mc, sess, runId) {
+  const payload = {};
+  for (const k of UPSTREAM_KEYS) if (params[k] !== undefined && params[k] !== null) payload[k] = params[k];
+  // reasoning_effort clamped per official model efforts table (no rejection, no model switch)
+  if (payload.reasoning_effort !== undefined) {
+    payload.reasoning_effort = normalizeReasoningEffort(mc.id, payload.reasoning_effort);
+  }
+  payload.model = mc.upstream;
+  payload.messages = normalizeMessages(params.messages);
+  payload.stream = true;
+  if (!payload.stop) payload.stop = ['"cb_easp"'];
+  payload.provider = { data_collection: "deny" };
+  // Toolset signature: Freebuff rejects requests with tools but no official tool names as
+  // foreign_toolset and refuses/downgrades the model (tool calls get restricted). end_turn is an official
+  // harmless tool in the TOOLS_WHICH_WONT_FORCE_NEXT_STEP whitelist; mixing it in allows tool-bearing
+  // requests to pass validation; end_turn is never actually called by the model, it only serves as a toolset signature.
+  if (Array.isArray(payload.tools) && payload.tools.length > 0) {
+    const hasSignature = payload.tools.some(
+      (t) => t && typeof t === "object" && t.function && typeof t.function.name === "string" && t.function.name === "end_turn",
+    );
+    if (!hasSignature) {
+      payload.tools = [
+        ...payload.tools,
+        { type: "function", function: { name: "end_turn", description: "Signal the end of the current task.", parameters: { type: "object", properties: {} } } },
+      ];
+    }
+  }
+  payload.codebuff_metadata = {
+    freebuff_instance_id: sess.instanceId,
+    trace_session_id: crypto.randomUUID(),
+    run_id: runId,
+    // Official SDK: client_id = clientSessionId (session-level stable identifier), not a random number
+    client_id: stableFingerprint(runId || "session"),
+    cost_mode: "free",
+  };
+  return payload;
+}
+
+// Phase 1 explicit code review mode: only triggers the reviewer sub-run when the caller explicitly requests it.
+// Normal chat always uses the root agent only; reviewer is never treated as a model fallback.
+function isCodeReviewRequest(params) {
+  return params && params.metadata && params.metadata.freebuff_mode === "code_review";
+}
+
+function buildReviewerMessages(params) {
+  const messages = Array.isArray(params.messages)
+    ? params.messages.map((m) => ({ ...m }))
+    : [];
+  // Aligned with official createReviewer(): reviewer inherits root context but cannot call tools or modify files.
+  messages.unshift({
+    role: "system",
+    content: "You are a subagent that reviews code changes and gives helpful critical feedback. Do not use any tools. Review the last file changes made by the assistant. Focus on missing requirements, correctness, regressions, dead code, missing imports, and consistency with the existing code. Be extremely concise and only suggest changes; do not modify files.",
+  });
+  const requestedPrompt = params.metadata && typeof params.metadata.freebuff_review_prompt === "string"
+    ? params.metadata.freebuff_review_prompt.trim()
+    : "";
+  messages.push({
+    role: "user",
+    content: requestedPrompt ||
+      "Review the recent code changes in the conversation. Give concise, critical feedback only.",
+  });
+  return messages;
+}
+
+function buildReviewerPayload(params, mc, sess, reviewerRunId) {
+  const metadata = params.metadata && typeof params.metadata === "object"
+    ? { ...params.metadata }
+    : undefined;
+  if (metadata) {
+    delete metadata.freebuff_mode;
+    delete metadata.freebuff_review_prompt;
+  }
+  return buildUpstreamPayload(
+    {
+      ...params,
+      metadata,
+      messages: buildReviewerMessages(params),
+      // Official code-reviewer toolNames=[]: reviewer can only give suggestions, cannot call tools.
+      tools: undefined,
+      tool_choice: undefined,
+      parallel_tool_calls: undefined,
+    },
+    mc,
+    sess,
+    reviewerRunId,
+  );
+}
+
+// ---------------------------------------------------------------------------
+// Chat main flow
+// ---------------------------------------------------------------------------
+
+// Find model config: hardcoded MODELS first, dynamic table supplements (merged)
+function findModelConfig(modelId) {
+  const hit = MODELS.find((m) => m.id === modelId);
+  if (hit) return hit;
+  const dyn = dynamicModelsCache.models;
+  if (dyn) {
+    const d = dyn.find((m) => m.id === modelId);
+    if (d) return d;
+  }
+  return null;
+}
+
+// Ensure dynamic registry is loaded before finding model config.
+// Cannot rely on /v1/models being called first: Cloudflare does not guarantee two requests land on the same isolate.
+async function resolveModelConfig(modelId) {
+  let hit = findModelConfig(modelId);
+  if (hit) return hit;
+  try {
+    const dyn = await refreshDynamicModelsIfStale();
+    if (dyn && dyn.models) {
+      hit = dyn.models.find((m) => m.id === modelId) || null;
+      if (hit) return hit;
+    }
+  } catch {}
+  return findModelConfig(modelId);
+}
+
+async function handleChat(request, env) {
+  let params;
+  try { params = await request.json(); } catch { return jsonResponse({ error: { message: "Invalid JSON", type: "parse_error" } }, 400); }
+  const isStream = !!params.stream;
+  const requestedModel = params.model || DEFAULT_MODEL;
+  const mc = await resolveModelConfig(requestedModel);
+  if (!mc) return jsonResponse({ error: { message: "Model not available: " + requestedModel, type: "unsupported_model" } }, 400);
+  return executeChat(env, params, mc, isStream, "chat");
+}
+
+// OpenAI Responses API (/v1/responses) entry: translates Responses requests into chat completions upstream calls
+async function handleResponses(request, env) {
+  let params;
+  try { params = await request.json(); } catch { return jsonResponse({ error: { message: "Invalid JSON", type: "parse_error" } }, 400); }
+  const isStream = !!params.stream;
+  const requestedModel = params.model || DEFAULT_MODEL;
+  const mc = await resolveModelConfig(requestedModel);
+  if (!mc) return jsonResponse({ error: { message: "Model not available: " + requestedModel, type: "unsupported_model" } }, 400);
+  return executeChat(env, responsesToChatParams(params, mc), mc, isStream, "responses");
+}
+
+// Responses API request → chat completions parameters (field name/structure translation)
+function responsesToChatParams(params, mc) {
+  const chat = {};
+  for (const k of ["temperature", "top_p", "tools", "tool_choice", "parallel_tool_calls", "stop", "seed", "store", "metadata", "user", "stream"]) {
+    if (params[k] !== undefined && params[k] !== null) chat[k] = params[k];
+  }
+  if (params.max_output_tokens !== undefined && params.max_output_tokens !== null) chat.max_completion_tokens = params.max_output_tokens;
+  if (params.reasoning && typeof params.reasoning === "object" && params.reasoning.effort) chat.reasoning_effort = params.reasoning.effort;
+  if (params.text && typeof params.text === "object" && params.text.format && params.text.format.type && params.text.format.type !== "text") {
+    chat.response_format = { type: params.text.format.type };
+    if (params.text.format.json_schema) chat.response_format.json_schema = params.text.format.json_schema;
+  }
+  // Responses tool format (flat function) → chat completions format (function wrapper).
+  // Upstream only accepts type:"function"; non-function tools like namespace/web_search are filtered out to avoid deserialization errors.
+  if (Array.isArray(params.tools)) {
+    chat.tools = params.tools
+      .filter((t) => t && typeof t === "object" && t.type === "function")
+      .map((t) => ({
+        type: "function",
+        function: {
+          name: t.name || "",
+          description: t.description || "",
+          parameters: t.parameters || { type: "object", properties: {} },
+        },
+      }));
+    if (chat.tools.length === 0) delete chat.tools;
+  }
+  // Responses tool_choice → chat format; only supports function type, other object forms fall back to auto
+  if (params.tool_choice && typeof params.tool_choice === "object") {
+    if (params.tool_choice.type === "function" && params.tool_choice.name) {
+      chat.tool_choice = { type: "function", function: { name: params.tool_choice.name } };
+    } else {
+      chat.tool_choice = "auto";
+    }
+  }
+  chat.model = mc.id;
+  chat.messages = responsesInputToMessages(params.input, params.instructions);
+  return chat;
+}
+
+// Responses API input → chat messages (input can be a string or an array of message items)
+function responsesInputToMessages(input, instructions) {
+  const messages = [];
+  if (instructions) messages.push({ role: "system", content: instructions });
+  if (typeof input === "string") { messages.push({ role: "user", content: input }); return messages; }
+  if (!Array.isArray(input)) { messages.push({ role: "user", content: input == null ? "" : String(input) }); return messages; }
+  for (const item of input) {
+    if (typeof item === "string") { messages.push({ role: "user", content: item }); continue; }
+    if (!item || typeof item !== "object") continue;
+    if (item.type === "function_call_output") {
+      messages.push({ role: "tool", tool_call_id: item.call_id || "", content: typeof item.output === "string" ? item.output : JSON.stringify(item.output ?? "") });
+      continue;
+    }
+    // function_call / reasoning / item_reference entries cannot be executed/replayed locally, skip them
+    if (item.type === "function_call" || item.type === "reasoning" || item.type === "item_reference") continue;
+    const role = item.role || "user";
+    const content = item.content;
+    if (typeof content === "string") { messages.push({ role, content }); continue; }
+    if (Array.isArray(content)) {
+      const parts = [];
+      for (const c of content) {
+        if (!c || typeof c !== "object") continue;
+        if (c.type === "input_text" || c.type === "output_text") { parts.push({ type: "text", text: c.text ?? "" }); continue; }
+        if (c.type === "text" && typeof c.text === "string") { parts.push(c); continue; }
+      }
+      messages.push({ role, content: parts.length ? parts : "" });
+      continue;
+    }
+    messages.push({ role, content: "" });
+  }
+  return messages;
+}
+
+// Phase 1: explicit code review mode.
+// This is a reviewer-only entry point: create a root run as the parent chain, then create a code-reviewer sub-run,
+// without executing a normal root chat or mixing the reviewer agent into the normal model routing.
+async function executeCodeReview(env, chatParams, mc, isStream, mode) {
+  const debug = env.FREEBUFF_DEBUG === "true";
+  const reviewerAgent = mc.reviewer_agent;
+  const reviewerModel = mc.upstream;
+  if (!reviewerAgent) {
+    return jsonResponse({
+      error: {
+        message: "Code review is not available for model: " + mc.id,
+        type: "unsupported_review_agent",
+      },
+    }, 400);
+  }
+
+  const pool = parseAccounts(env);
+  if (pool.length === 0) {
+    return jsonResponse({ error: { message: "Missing FREEBUFF_TOKEN environment variable", type: "config_error" } }, 503);
+  }
+
+  let lastErrMsg = "";
+  for (let acctTry = 0; acctTry < pool.length; acctTry++) {
+    const acct = pickToken(env, mc.session);
+    const token = acct ? acct.token : null;
+    if (!token) break;
+    logAccountRoute(debug, pool, token, mc.session, acctTry + 1,
+      isUsableSession(sessCache.get(token + ":" + mc.session)) ? "active_session" : "quota_or_round_robin");
+    let rootRunId = null;
+    let reviewerRunId = null;
+    try {
+      const sess = await createSession(token, mc.session);
+      const root = await startRunChain(token, mc.root_agent || mc.agent);
+      rootRunId = root.runId;
+      // Desktop protocol key: reviewer is a child run of the root run.
+      reviewerRunId = await startRun(token, reviewerAgent, [rootRunId]);
+      if (debug) console.log(`[review][acct ${acctTry + 1}] root=${rootRunId} reviewer=${reviewerRunId} model=${reviewerModel}`);
+
+      const payload = buildReviewerPayload(chatParams, { ...mc, upstream: reviewerModel }, sess, reviewerRunId);
+      const resp = await fetch(...resolveChatUrl("/api/v1/chat/completions", {
+        Authorization: "Bearer " + token,
+        "Content-Type": "application/json",
+        "x-freebuff-instance-id": sess.instanceId,
+      }), {
+        method: "POST",
+        body: JSON.stringify(payload),
+        signal: isStream ? undefined : AbortSignal.timeout(NONSTREAM_TIMEOUT_MS),
+      });
+      if (!resp.ok) {
+        const text = await resp.text();
+        recordAccountObservation(token, resp.status, text);
+        lastErrMsg = "reviewer upstream error: " + text.slice(0, 300);
+        cooldown(token, parseCooldown(text, resp.status));
+        throw new Error(lastErrMsg);
+      }
+
+      let finalized = false;
+      const finalize = async () => {
+        if (finalized) return;
+        finalized = true;
+        if (reviewerRunId) await finishRun(token, reviewerRunId, 1).catch(() => {});
+        if (rootRunId) await finishRun(token, rootRunId, 1).catch(() => {});
+      };
+
+      if (isStream) {
+        const { readable, writable } = new TransformStream();
+        if (mode === "responses") pipeUpstreamToResponsesStream(resp.body, writable, mc, finalize);
+        else pipeUpstreamToClient(resp.body, writable, finalize);
+        return new Response(readable, {
+          status: 200,
+          headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", ...corsHeaders() },
+        });
+      }
+
+      const result = mode === "responses"
+        ? await responsesToNonStream(resp.body, mc)
+        : await streamToNonStream(resp.body, reviewerModel);
+      await finalize();
+      return mode === "responses" ? jsonResponse(result, 200) : jsonResponse(result, 200);
+    } catch (e) {
+      console.error("[code_review]", e);
+      lastErrMsg = String(e.message || e);
+      if (reviewerRunId) await finishRun(token, reviewerRunId, 1).catch(() => {});
+      if (rootRunId) await finishRun(token, rootRunId, 1).catch(() => {});
+      if (/start_run failed|timeout|timed out|abort|reviewer upstream/i.test(lastErrMsg)) cooldown(token, 60 * 1000);
+    }
+  }
+  return jsonResponse({ error: { message: lastErrMsg || "code reviewer failed", type: "api_error" } }, 502);
+}
+
+// Shared upstream execution for chat completions and responses: multi-account retry + session/run lifecycle + streaming/non-streaming output
+async function executeChat(env, chatParams, mc, isStream, mode) {
+  if (isCodeReviewRequest(chatParams)) return executeCodeReview(env, chatParams, mc, isStream, mode);
+  const debug = env.FREEBUFF_DEBUG === "true";
+  const pool = parseAccounts(env);
+  if (pool.length === 0) return jsonResponse({ error: { message: "Missing FREEBUFF_TOKEN environment variable", type: "config_error" } }, 503);
+
+  // In-request multi-account retry: if one account fails (timeout/429/428 stale session/run failure), immediately cool it down and try the next, up to the entire pool.
+  // Free-tier upstream is volatile (concurrency >1 causes issues, queue timeouts). Switching accounts within a single request is much more reliable than client retry.
+  let lastErrMsg = "";
+  for (let acctTry = 0; acctTry < pool.length; acctTry++) {
+    const acct = pickToken(env, mc.session);
+    const token = acct ? acct.token : null;
+    if (!token) break;
+    logAccountRoute(debug, pool, token, mc.session, acctTry + 1,
+      isUsableSession(sessCache.get(token + ":" + mc.session)) ? "active_session" : "quota_or_round_robin");
+    try {
+      // 1) session
+      const sess = await createSession(token, mc.session);
+      if (debug) console.log(`[acct ${acctTry + 1}] session=${sess.instanceId}`);
+
+      // 2) run chain
+      const run = await startRunChain(token, mc.agent);
+      if (debug) console.log(`[acct ${acctTry + 1}] run=${run.runId}`);
+
+      // 3) chat (428 waiting_room_required / 409 session_superseded = session stale,
+      //    clear cache, force-rebuild, and retry once; if still failing, cool down the account and let the outer loop switch)
+      let resp, errText = "", sessForChat = sess;
+      for (let attempt = 0; attempt < 2; attempt++) {
+        const payload = buildUpstreamPayload(chatParams, mc, sessForChat, run.runId);
+        const headers = {
+          Authorization: "Bearer " + token,
+          "Content-Type": "application/json",
+          "x-freebuff-instance-id": sessForChat.instanceId,
+        };
+        // x-freebuff-acting-user-id: ⚠️ Tested (2026-08-10) — chat only passes (200) without this header,
+        // adding it causes 409 session_superseded ("Another instance of freebuff has taken over
+        // this session. Only one instance per account is allowed."）。
+        // Reason: the pre-generated instance-id already binds the session to the token itself; adding acting-user-id
+        // makes the server think a second instance is competing for the same slot. Desktop also omits this header by default (only used when
+        // impersonating another user). So we no longer send acting-user-id.
+        if (debug) console.log(`[acct ${acctTry + 1}][chat] attempt=${attempt + 1}`);
+        const [chatUrl, chatHeaders] = resolveChatUrl("/api/v1/chat/completions", headers);
+        const chatInit = {
+          method: "POST", headers: chatHeaders, body: JSON.stringify(payload),
+        };
+        try {
+          resp = isStream
+            ? await fetchStreamWithQuotaGuard(chatUrl, chatInit, token, mc.session)
+            : await fetch(chatUrl, {
+                ...chatInit,
+                signal: AbortSignal.timeout(NONSTREAM_TIMEOUT_MS),
+              });
+        } catch (error) {
+          // Empty stream is treated as a potentially dirty session for the same model on the current account:
+          // delete the old upstream instance, rebuild the same-model session, and retry once; never switch to a different model.
+          if (error instanceof EmptyUpstreamStreamError && attempt === 0) {
+            await deleteUpstreamSession(token, sessForChat.instanceId);
+            if (debug) console.log(`[acct ${acctTry + 1}][chat] empty stream, same-model session recovery`);
+            sessForChat = await createSession(token, mc.session, true);
+            continue;
+          }
+          throw error;
+        }
+        if (resp.ok) {
+          recordAccountObservation(token, resp.status, null);
+          // Empty/near-empty success body is a transient upstream hiccup:
+          // retry once with a rebuilt session instead of returning garbage.
+          if (!isStream) {
+            const rawBody = await resp.text();
+            if (!rawBody || rawBody.trim().length < 2) {
+              if (attempt === 0) {
+                await deleteUpstreamSession(token, sessForChat.instanceId);
+                if (debug) console.log(`[acct ${acctTry + 1}][chat] empty body, retry once`);
+                sessForChat = await createSession(token, mc.session, true);
+                continue;
+              }
+              errText = "upstream returned empty body";
+              resp = { ok: false, status: 502, text: async () => errText };
+              break;
+            }
+            // Rewrap so downstream (streamToNonStream) sees the original body
+            resp = new Response(rawBody, { status: 200, headers: { "Content-Type": "application/json" } });
+          }
+          break;
+        }
+        errText = await resp.text();
+        recordAccountObservation(token, resp.status, errText);
+        // 428 waiting_room_required (no active session) / 409 session_superseded (replaced by a new session)
+        // both indicate the cached instance is stale → clear cache, force rebuild, and retry once; not rate limiting, no cooldown
+        const staleSession =
+          isStaleSessionGate(resp.status, errText) ||
+          // Older upstream wrappers returned model mismatch as HTTP 502.
+          (resp.status === 502 && (errText.includes("session_model_mismatch") || errText.includes("not valid for limited access")));
+        if (staleSession && attempt === 0) {
+          await deleteUpstreamSession(token, sessForChat.instanceId);
+          if (debug) console.log(`[acct ${acctTry + 1}][chat] session stale (${resp.status}), recreate…`);
+          sessForChat = await createSession(token, mc.session, true);
+          continue;
+        }
+        // Generic 502/504 (transient upstream gateway errors) — rebuild session and retry once
+        // before giving up on this account, instead of immediately switching.
+        if ((resp.status === 502 || resp.status === 504) && attempt === 0 && !staleSession) {
+          if (debug) console.log(`[acct ${acctTry + 1}][chat] upstream ${resp.status}, rebuild + retry once`);
+          try {
+            await deleteUpstreamSession(token, sessForChat.instanceId);
+          } catch (e) {}
+          sessForChat = await createSession(token, mc.session, true);
+          continue;
+        }
+        // Still failing after rebuild: account session state is abnormal, cool down and let outer loop switch
+        if (staleSession) cooldown(token, 60 * 1000);
+        cooldown(token, parseCooldown(errText, resp.status));
+        break;
+      }
+      if (!resp.ok) {
+        lastErrMsg = "upstream error: " + (errText || "").slice(0, 300);
+        if (debug) console.log(`[acct ${acctTry + 1}] failed ${resp.status}, switch account`);
+        continue;
+      }
+
+      if (isStream) {
+        const { readable, writable } = new TransformStream();
+        if (mode === "responses") pipeUpstreamToResponsesStream(resp.body, writable, mc);
+        else pipeUpstreamToClient(resp.body, writable);
+        return new Response(readable, { status: 200, headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", ...corsHeaders() } });
+      }
+
+      if (mode === "responses") return jsonResponse(await responsesToNonStream(resp.body, mc), 200);
+
+      const agg = await streamToNonStream(resp.body, mc.upstream);
+      return jsonResponse(agg, 200);
+    } catch (e) {
+      console.error("[" + mode + "]", e);
+      const msg = String(e.message || e);
+      // Quota probe confirmed exhaustion: clear current model session, cool down per upstream retryAfterMs, then switch accounts.
+      if (e instanceof QuotaExhaustedError) {
+        sessCache.delete(token + ":" + mc.session);
+        cooldown(token, e.retryAfterMs || 5 * 60 * 1000);
+      }
+      if (e instanceof EmptyUpstreamStreamError) {
+        cooldown(token, 60 * 1000);
+      }
+      // Other upstream interaction failures/timeouts continue using the original cooldown logic; streaming chat no longer enters here from a fixed 20s abort.
+      // createSession 429 (quota exhausted) uses retryAfterMs/text-based cooldown, not a fixed 60s.
+      if (/create session failed|stayed queued|start_run failed|session_model_mismatch|abort|timeout|timed out|terminated/i.test(msg)) {
+        const m429 = msg.match(/429/);
+        cooldown(token, m429 ? parseCooldown(msg, 429) : 60 * 1000);
+      }
+      lastErrMsg = msg;
+      if (debug) console.log(`[acct ${acctTry + 1}] exception: ${msg.slice(0, 120)}, switch account`);
+    }
+  }
+  return jsonResponse({ error: { message: lastErrMsg, type: "api_error" } }, 502);
+}
+
+
+// ---------------------------------------------------------------------------
+// Anthropic Messages API (local adapter, reuses the stable executeChat main path)
+// ---------------------------------------------------------------------------
+function anthropicModelToOpenAI(model) {
+  const raw = String(model || DEFAULT_MODEL).trim();
+  if (findModelConfig(raw)) return raw;
+  const short = raw.replace(/^anthropic\//, "");
+  const hit = MODELS.find((m) => m.id.toLowerCase().endsWith("/" + short.toLowerCase()));
+  return hit ? hit.id : DEFAULT_MODEL;
+}
+
+function anthropicText(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  return content.filter((p) => p && p.type === "text" && typeof p.text === "string").map((p) => p.text).join("\n");
+}
+
+function anthropicContent(content) {
+  if (typeof content === "string") return content;
+  if (!Array.isArray(content)) return "";
+  const out = [];
+  for (const p of content) {
+    if (!p || typeof p !== "object") continue;
+    if (p.type === "text" && typeof p.text === "string") out.push({ type: "text", text: p.text });
+    if (p.type === "image" && p.source && typeof p.source === "object") {
+      const s = p.source;
+      if (s.type === "base64" && s.media_type && s.data) out.push({ type: "image_url", image_url: { url: `data:${s.media_type};base64,${s.data}` } });
+      else if (s.type === "url" && s.url) out.push({ type: "image_url", image_url: { url: s.url } });
+    }
+  }
+  return out;
+}
+
+function anthropicToChat(body, mc) {
+  const chat = { model: mc.id, stream: !!body.stream, messages: [] };
+  if (body.stream) chat.stream_options = { include_usage: true };
+  const system = anthropicText(body.system);
+  if (system) chat.messages.push({ role: "system", content: system });
+  if (body.max_tokens != null) chat.max_completion_tokens = body.max_tokens;
+  for (const k of ["temperature", "top_p", "top_k", "presence_penalty", "frequency_penalty"]) if (body[k] != null) chat[k] = body[k];
+  if (Array.isArray(body.stop_sequences) && body.stop_sequences.length) chat.stop = body.stop_sequences;
+  if (body.thinking?.type === "enabled" && Number.isFinite(body.thinking.budget_tokens)) {
+    // Anthropic thinking budget → reasoning effort mapping; even if clamping produces
+    // medium (unsupported by deepseek-v4-flash), it will be clamped to the nearest available level
+    chat.reasoning_effort = body.thinking.budget_tokens >= 16000 ? "high" : body.thinking.budget_tokens >= 8000 ? "medium" : "low";
+  }
+  if (body.metadata && typeof body.metadata === "object") chat.metadata = body.metadata;
+
+  if (Array.isArray(body.tools) && body.tools.length) {
+    chat.tools = body.tools.filter((t) => t && t.name).map((t) => ({ type: "function", function: { name: t.name, description: t.description || "", parameters: t.input_schema || { type: "object", properties: {} } } }));
+    const tc = body.tool_choice;
+    if (tc?.type === "auto") chat.tool_choice = "auto";
+    else if (tc?.type === "any") chat.tool_choice = "required";
+    else if (tc?.type === "none") chat.tool_choice = "none";
+    else if (tc?.type === "tool" && tc.name) chat.tool_choice = { type: "function", function: { name: tc.name } };
+  }
+
+  for (const m of Array.isArray(body.messages) ? body.messages : []) {
+    if (!m || typeof m !== "object") continue;
+    if (m.role === "user") {
+      const parts = Array.isArray(m.content) ? m.content : [];
+      const results = parts.filter((p) => p && p.type === "tool_result");
+      if (results.length) {
+        for (const p of results) chat.messages.push({ role: "tool", tool_call_id: p.tool_use_id || "", content: anthropicContent(p.content) });
+        const text = parts.filter((p) => p && p.type === "text" && p.text).map((p) => p.text).join("\n");
+        if (text) chat.messages.push({ role: "user", content: text });
+      } else chat.messages.push({ role: "user", content: anthropicContent(m.content) });
+    } else if (m.role === "assistant") {
+      const uses = Array.isArray(m.content) ? m.content.filter((p) => p && p.type === "tool_use") : [];
+      if (uses.length) chat.messages.push({ role: "assistant", content: anthropicText(m.content), tool_calls: uses.map((p) => ({ id: p.id || ("call_" + Math.random().toString(36).slice(2, 10)), type: "function", function: { name: p.name || "", arguments: JSON.stringify(p.input ?? {}) } })) });
+      else chat.messages.push({ role: "assistant", content: anthropicText(m.content) });
+    }
+  }
+  return chat;
+}
+
+function anthropicStopReason(reason) {
+  if (reason === "tool_calls") return "tool_use";
+  if (reason === "length") return "max_tokens";
+  return "end_turn";
+}
+
+function anthropicFromChat(oai, mc) {
+  const choice = oai?.choices?.[0] || {};
+  const msg = choice.message || {};
+  const content = [];
+  if (msg.content) content.push({ type: "text", text: msg.content });
+  for (const tc of msg.tool_calls || []) {
+    let input = {};
+    try { input = JSON.parse(tc.function?.arguments || "{}"); } catch {}
+    content.push({ type: "tool_use", id: tc.id || ("toolu_" + Math.random().toString(36).slice(2, 10)), name: tc.function?.name || "", input });
+  }
+  if (!content.length) content.push({ type: "text", text: "" });
+  const u = oai?.usage || {};
+  return { id: oai?.id || ("msg_" + Math.random().toString(36).slice(2, 10)), type: "message", role: "assistant", model: mc.id, content, stop_reason: anthropicStopReason(choice.finish_reason), stop_sequence: null, usage: { input_tokens: u.prompt_tokens ?? 0, output_tokens: u.completion_tokens ?? 0 } };
+}
+
+function anthropicError(message, type, status, retryAfter) {
+  const headers = { ...corsHeaders() };
+  if (retryAfter) headers["Retry-After"] = String(retryAfter);
+  return jsonResponse({ type: "error", error: { type: type || "api_error", message: String(message || "Upstream error") } }, status || 500, headers);
+}
+
+function estimateAnthropicTokens(value) {
+  if (typeof value === "string") return value.length;
+  if (Array.isArray(value)) return value.reduce((n, x) => n + estimateAnthropicTokens(x), 0);
+  if (value && typeof value === "object") return Object.entries(value).reduce((n, [k, v]) => n + k.length + estimateAnthropicTokens(v), 0);
+  return 0;
+}
+
+async function handleAnthropicCountTokens(request, env) {
+  let body;
+  try { body = await request.json(); } catch { return anthropicError("Invalid JSON", "invalid_request_error", 400); }
+  const openaiModel = anthropicModelToOpenAI(body.model);
+  const mc = findModelConfig(openaiModel);
+  if (!mc) return anthropicError("Model not available: " + (body.model || ""), "invalid_request_error", 400);
+  const chat = anthropicToChat(body, mc);
+  return jsonResponse({ input_tokens: Math.max(1, Math.ceil(estimateAnthropicTokens(chat.messages) / 4)) }, 200);
+}
+
+function anthropicStream(mc) {
+  const decoder = new TextDecoder();
+  let buffer = "", started = false, ended = false, block = null, blockIndex = -1, reason = "end_turn", input = 0, output = 0;
+  const encoder = new TextEncoder();
+  const events = (ctl, name, data) => { if (!data.type) data.type = name; ctl.enqueue(encoder.encode(`event: ${name}\ndata: ${JSON.stringify(data)}\n\n`)); };
+  const close = (ctl) => { if (block) { events(ctl, "content_block_stop", { index: block.index }); block = null; } };
+  const end = (ctl) => {
+    if (ended) return; ended = true;
+    if (!started) events(ctl, "message_start", { message: { id: "msg_" + Math.random().toString(36).slice(2, 10), type: "message", role: "assistant", model: mc.id, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: input, output_tokens: 0 } } });
+    close(ctl);
+    events(ctl, "message_delta", { delta: { stop_reason: reason, stop_sequence: null }, usage: { output_tokens: output } });
+    events(ctl, "message_stop", {});
+  };
+  return new TransformStream({
+    transform(chunk, ctl) {
+      if (ended) return;
+      buffer += decoder.decode(chunk, { stream: true });
+      let pos;
+      while ((pos = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, pos).trim(); buffer = buffer.slice(pos + 1);
+        if (!line.startsWith("data:")) continue;
+        const raw = line.slice(5).trim();
+        if (raw === "[DONE]") { end(ctl); continue; }
+        let obj; try { obj = JSON.parse(raw); } catch { continue; }
+        if (obj.usage) { input = obj.usage.prompt_tokens ?? input; output = obj.usage.completion_tokens ?? output; }
+        const choice = obj.choices?.[0]; if (!choice) continue;
+        const delta = choice.delta || {};
+        if (!started) { started = true; events(ctl, "message_start", { message: { id: "msg_" + Math.random().toString(36).slice(2, 10), type: "message", role: "assistant", model: mc.id, content: [], stop_reason: null, stop_sequence: null, usage: { input_tokens: input, output_tokens: 0 } } }); }
+        if (Array.isArray(delta.tool_calls)) {
+          for (const tc of delta.tool_calls) {
+            const fn = tc.function || {}; const idx = tc.index ?? 0;
+            if (!block || block.kind !== "tool" || block.sourceIndex !== idx) { close(ctl); block = { index: ++blockIndex, kind: "tool", sourceIndex: idx }; events(ctl, "content_block_start", { index: block.index, content_block: { type: "tool_use", id: tc.id || ("toolu_" + Math.random().toString(36).slice(2, 10)), name: fn.name || "", input: {} } }); }
+            if (fn.arguments) events(ctl, "content_block_delta", { index: block.index, delta: { type: "input_json_delta", partial_json: fn.arguments } });
+          }
+        } else if (delta.content) {
+          if (!block || block.kind !== "text") { close(ctl); block = { index: ++blockIndex, kind: "text" }; events(ctl, "content_block_start", { index: block.index, content_block: { type: "text", text: "" } }); }
+          events(ctl, "content_block_delta", { index: block.index, delta: { type: "text_delta", text: delta.content } });
+        }
+        if (choice.finish_reason) reason = anthropicStopReason(choice.finish_reason);
+      }
+    },
+    flush(ctl) { end(ctl); },
+  });
+}
+
+async function handleAnthropicMessages(request, env) {
+  let body;
+  try { body = await request.json(); } catch { return anthropicError("Invalid JSON", "invalid_request_error", 400); }
+  const openaiModel = anthropicModelToOpenAI(body.model);
+  const mc = findModelConfig(openaiModel);
+  if (!mc) return anthropicError("Model not available: " + (body.model || ""), "invalid_request_error", 400);
+  const chat = anthropicToChat(body, mc);
+  const response = await executeChat(env, chat, mc, !!chat.stream, "chat");
+  if (response.status >= 400) {
+    let msg = "Upstream error"; try { const data = await response.json(); msg = data?.error?.message || msg; } catch {}
+    const types = { 400: "invalid_request_error", 401: "authentication_error", 403: "permission_error", 429: "rate_limit_error", 503: "overloaded_error" };
+    return anthropicError(msg, types[response.status] || "api_error", response.status, response.headers.get("Retry-After"));
+  }
+  if (!chat.stream) return jsonResponse(anthropicFromChat(await response.json(), mc), response.status);
+  return new Response(response.body.pipeThrough(anthropicStream(mc)), { status: response.status, headers: { "Content-Type": "text/event-stream", "Cache-Control": "no-cache", ...corsHeaders() } });
+}
+
+
+
+function unwrapData(obj) {
+  if (obj && obj.data && typeof obj.data === "object" && (obj.data.choices || obj.data.id || obj.data.usage)) return obj.data;
+  return obj;
+}
+
+// Streaming: strip the {data:...} wrapper from upstream SSE and pass through
+function pipeUpstreamToClient(upstreamBody, writable, onComplete) {
+  const reader = upstreamBody.getReader();
+  const writer = writable.getWriter();
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  let buf = "";
+  (async () => {
+    try {
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, idx); buf = buf.slice(idx + 1);
+          if (line.startsWith("data:")) {
+            const payload = line.slice(5).trim();
+            if (payload === "" || payload === "[DONE]") { await writer.write(encoder.encode(line + "\n\n")); continue; }
+            try {
+              const normalized = unwrapData(JSON.parse(payload));
+              await writer.write(encoder.encode("data: " + JSON.stringify(normalized) + "\n\n"));
+            } catch { await writer.write(encoder.encode(line + "\n")); }
+          } else {
+            await writer.write(encoder.encode(line + "\n"));
+          }
+        }
+      }
+    } catch {}
+    finally {
+      try { if (onComplete) await onComplete(); } catch {}
+      try { await writer.close(); } catch {}
+    }
+  })();
+}
+
+// Non-streaming: aggregate upstream stream into an OpenAI non-streaming response object
+async function streamToNonStream(upstreamBody, upstreamModel) {
+  const reader = upstreamBody.getReader();
+  const decoder = new TextDecoder();
+  let buf = "", content = "", reasoning = "", finishReason = null, model = "", id = "", usage = null;
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, idx); buf = buf.slice(idx + 1);
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (payload === "" || payload === "[DONE]") continue;
+      try {
+        const obj = unwrapData(JSON.parse(payload));
+        const choice = obj?.choices?.[0];
+        if (!choice) continue;
+        const delta = choice.delta || {};
+        if (delta.content) content += delta.content;
+        if (delta.reasoning_content) reasoning += delta.reasoning_content;
+        if (choice.finish_reason) finishReason = choice.finish_reason;
+        if (obj.id) id = obj.id;
+        if (obj.model) model = obj.model;
+        if (obj.usage) usage = obj.usage;
+      } catch {}
+    }
+  }
+  const msg = { role: "assistant", content };
+  if (reasoning && !content) { msg.content = reasoning; msg.reasoning_used_as_content = true; }
+  else if (reasoning) msg.reasoning_content = reasoning;
+  return {
+    id: id || "gen_" + Date.now(),
+    object: "chat.completion",
+    created: Math.floor(Date.now() / 1000),
+    model: model || upstreamModel,
+    choices: [{ index: 0, message: msg, finish_reason: finishReason || "stop", logprobs: null }],
+    usage: usage || { prompt_tokens: 0, completion_tokens: 0, total_tokens: 0 },
+  };
+}
+
+// ---------------------------------------------------------------------------
+// Responses API (/v1/responses) output
+// ---------------------------------------------------------------------------
+
+function responsesBase(mc, respId, createdAt) {
+  return {
+    id: respId || "resp_" + Math.random().toString(36).slice(2, 10),
+    object: "response",
+    created_at: createdAt ?? Math.floor(Date.now() / 1000),
+    status: "in_progress",
+    error: null,
+    incomplete_details: null,
+    instructions: null,
+    max_output_tokens: null,
+    model: mc.id,
+    output: [],
+    parallel_tool_calls: true,
+    previous_response_id: null,
+    reasoning: { effort: null, summary: null },
+    store: true,
+    temperature: 1.0,
+    text: { format: { type: "text" } },
+    tool_choice: "auto",
+    tools: [],
+    top_p: 1.0,
+    truncation: "disabled",
+    usage: null,
+    user: null,
+    metadata: {},
+  };
+}
+
+function responsesUsage() {
+  return { input_tokens: 0, input_tokens_details: { cached_tokens: 0 }, output_tokens: 0, output_tokens_details: { reasoning_tokens: 0 }, total_tokens: 0 };
+}
+
+// Upstream is Chat Completions format; Responses API requires input/output_tokens.
+// Normalize uniformly to avoid passing incomplete or malformed usage directly to strict clients.
+function chatUsageToResponsesUsage(usage) {
+  if (!usage || typeof usage !== "object") return responsesUsage();
+  const inputTokens = Number.isFinite(usage.input_tokens)
+    ? usage.input_tokens
+    : Number.isFinite(usage.prompt_tokens) ? usage.prompt_tokens : 0;
+  const outputTokens = Number.isFinite(usage.output_tokens)
+    ? usage.output_tokens
+    : Number.isFinite(usage.completion_tokens) ? usage.completion_tokens : 0;
+  const totalTokens = Number.isFinite(usage.total_tokens)
+    ? usage.total_tokens
+    : inputTokens + outputTokens;
+  const inputDetails = usage.input_tokens_details && typeof usage.input_tokens_details === "object"
+    ? usage.input_tokens_details : {};
+  const outputDetails = usage.output_tokens_details && typeof usage.output_tokens_details === "object"
+    ? usage.output_tokens_details : {};
+  return {
+    input_tokens: inputTokens,
+    input_tokens_details: { cached_tokens: Number.isFinite(inputDetails.cached_tokens) ? inputDetails.cached_tokens : 0 },
+    output_tokens: outputTokens,
+    output_tokens_details: { reasoning_tokens: Number.isFinite(outputDetails.reasoning_tokens) ? outputDetails.reasoning_tokens : 0 },
+    total_tokens: totalTokens,
+  };
+}
+
+// Streaming: upstream chat SSE → Responses API event sequence (response.created ... response.completed)
+async function pipeUpstreamToResponsesStream(upstreamBody, writable, mc, onComplete) {
+  const reader = upstreamBody.getReader();
+  const writer = writable.getWriter();
+  const decoder = new TextDecoder();
+  const encoder = new TextEncoder();
+  const respId = "resp_" + Math.random().toString(36).slice(2, 10);
+  const createdAt = Math.floor(Date.now() / 1000);
+  let buf = "", model = "", usage = null;
+  const send = (obj) => writer.write(encoder.encode("data: " + JSON.stringify(obj) + "\n\n"));
+
+  // Record output items in upstream order: message (text) or function_call (tool call)
+  const items = [];
+  let nextOutputIndex = 0;
+  let contentItem = null;
+  const toolItems = new Map(); // upstream tool_calls index → output item
+
+  const startContent = () => {
+    const item = {
+      kind: "message",
+      id: "msg_" + Math.random().toString(36).slice(2, 10),
+      outputIndex: nextOutputIndex++,
+      text: "",
+      contentIndex: 0,
+      started: false,
+    };
+    items.push(item);
+    return item;
+  };
+  const startTool = (tc) => {
+    const fn = tc.function || {};
+    const item = {
+      kind: "function_call",
+      id: "fc_" + Math.random().toString(36).slice(2, 10),
+      outputIndex: nextOutputIndex++,
+      callId: tc.id || "call_" + Math.random().toString(36).slice(2, 10),
+      name: fn.name || "",
+      args: "",
+    };
+    items.push(item);
+    return item;
+  };
+
+  (async () => {
+    try {
+      await send({ type: "response.created", response: responsesBase(mc, respId, createdAt) });
+      await send({ type: "response.in_progress", response: responsesBase(mc, respId, createdAt) });
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        buf += decoder.decode(value, { stream: true });
+        let idx;
+        while ((idx = buf.indexOf("\n")) >= 0) {
+          const line = buf.slice(0, idx); buf = buf.slice(idx + 1);
+          if (!line.startsWith("data:")) continue;
+          const payload = line.slice(5).trim();
+          if (payload === "" || payload === "[DONE]") continue;
+          try {
+            const obj = unwrapData(JSON.parse(payload));
+            const choice = obj?.choices?.[0];
+            if (!choice) continue;
+            const delta = choice.delta || {};
+                if (obj.model) model = obj.model;
+                if (obj.usage) usage = obj.usage;
+
+            // Tool call delta (chat format delta.tool_calls[])
+            if (Array.isArray(delta.tool_calls)) {
+              for (const tc of delta.tool_calls) {
+                if (!tc || typeof tc !== "object") continue;
+                const ti = tc.index ?? 0;
+                let item = toolItems.get(ti);
+                if (!item) {
+                  item = startTool(tc);
+                  toolItems.set(ti, item);
+                  await send({ type: "response.output_item.added", output_index: item.outputIndex, item: { id: item.id, type: "function_call", status: "in_progress", call_id: item.callId, name: item.name, arguments: "" } });
+                }
+                const fn = tc.function || {};
+                if (fn.name && !item.name) item.name = fn.name;
+                if (fn.arguments) {
+                  item.args += fn.arguments;
+                  await send({ type: "response.function_call_arguments.delta", item_id: item.id, output_index: item.outputIndex, delta: fn.arguments });
+                }
+              }
+            }
+
+            // Text delta
+            if (delta.content) {
+              if (!contentItem) contentItem = startContent();
+              if (!contentItem.started) {
+                contentItem.started = true;
+                await send({ type: "response.output_item.added", output_index: contentItem.outputIndex, item: { id: contentItem.id, type: "message", status: "in_progress", role: "assistant", content: [] } });
+                await send({ type: "response.content_part.added", item_id: contentItem.id, output_index: contentItem.outputIndex, content_index: contentItem.contentIndex, part: { type: "output_text", text: "", annotations: [] } });
+              }
+              contentItem.text += delta.content;
+              await send({ type: "response.output_text.delta", item_id: contentItem.id, output_index: contentItem.outputIndex, content_index: contentItem.contentIndex, delta: delta.content });
+            }
+          } catch {}
+        }
+      }
+
+      // When there is neither text nor tool calls, add an empty message to avoid an empty output array
+      if (items.length === 0) {
+        const item = startContent();
+        item.started = true;
+        await send({ type: "response.output_item.added", output_index: item.outputIndex, item: { id: item.id, type: "message", status: "in_progress", role: "assistant", content: [] } });
+        await send({ type: "response.content_part.added", item_id: item.id, output_index: item.outputIndex, content_index: item.contentIndex, part: { type: "output_text", text: "", annotations: [] } });
+      }
+
+      // Cleanup: emit done events for each output item in order of appearance
+      for (const item of items) {
+        if (item.kind === "message") {
+          if (!item.started) {
+            await send({ type: "response.output_item.added", output_index: item.outputIndex, item: { id: item.id, type: "message", status: "in_progress", role: "assistant", content: [] } });
+            await send({ type: "response.content_part.added", item_id: item.id, output_index: item.outputIndex, content_index: item.contentIndex, part: { type: "output_text", text: "", annotations: [] } });
+          }
+          const part = { type: "output_text", text: item.text, annotations: [] };
+          await send({ type: "response.output_text.done", item_id: item.id, output_index: item.outputIndex, content_index: item.contentIndex, text: item.text });
+          await send({ type: "response.content_part.done", item_id: item.id, output_index: item.outputIndex, content_index: item.contentIndex, part });
+          await send({ type: "response.output_item.done", output_index: item.outputIndex, item: { id: item.id, type: "message", status: "completed", role: "assistant", content: [part] } });
+        } else {
+          await send({ type: "response.output_item.done", output_index: item.outputIndex, item: { id: item.id, type: "function_call", status: "completed", call_id: item.callId, name: item.name, arguments: item.args } });
+        }
+      }
+
+      const resp = responsesBase(mc, respId, createdAt);
+      resp.status = "completed";
+      resp.model = model || mc.id;
+      resp.output = items.map((item) =>
+        item.kind === "message"
+          ? { id: item.id, type: "message", status: "completed", role: "assistant", content: [{ type: "output_text", text: item.text, annotations: [] }] }
+          : { id: item.id, type: "function_call", status: "completed", call_id: item.callId, name: item.name, arguments: item.args }
+      );
+      resp.usage = chatUsageToResponsesUsage(usage);
+      await send({ type: "response.completed", response: resp });
+    } catch {}
+    finally {
+      try { if (onComplete) await onComplete(); } catch {}
+      try { await writer.close(); } catch {}
+    }
+  })();
+}
+
+// Non-streaming: aggregate upstream stream into a Responses API non-streaming response object
+async function responsesToNonStream(upstreamBody, mc) {
+  const reader = upstreamBody.getReader();
+  const decoder = new TextDecoder();
+  let buf = "", model = "", outputText = "", reasoning = "", usage = null;
+  const toolItems = new Map(); // upstream tool_calls index → {id, callId, name, args}
+  while (true) {
+    const { done, value } = await reader.read();
+    if (done) break;
+    buf += decoder.decode(value, { stream: true });
+    let idx;
+    while ((idx = buf.indexOf("\n")) >= 0) {
+      const line = buf.slice(0, idx); buf = buf.slice(idx + 1);
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (payload === "" || payload === "[DONE]") continue;
+      try {
+        const obj = unwrapData(JSON.parse(payload));
+        const choice = obj?.choices?.[0];
+        if (!choice) continue;
+        const delta = choice.delta || {};
+        if (delta.content) outputText += delta.content;
+        if (delta.reasoning_content) reasoning += delta.reasoning_content;
+        if (Array.isArray(delta.tool_calls)) {
+          for (const tc of delta.tool_calls) {
+            if (!tc || typeof tc !== "object") continue;
+            const ti = tc.index ?? 0;
+            let item = toolItems.get(ti);
+            if (!item) {
+              const fn = tc.function || {};
+              item = {
+                id: "fc_" + Math.random().toString(36).slice(2, 10),
+                callId: tc.id || "call_" + Math.random().toString(36).slice(2, 10),
+                name: fn.name || "",
+                args: "",
+              };
+              toolItems.set(ti, item);
+            }
+            const fn = tc.function || {};
+            if (fn.name && !item.name) item.name = fn.name;
+            if (fn.arguments) item.args += fn.arguments;
+          }
+        }
+        if (obj.model) model = obj.model;
+        if (obj.usage) usage = obj.usage;
+      } catch {}
+    }
+  }
+  const resp = responsesBase(mc, undefined, Math.floor(Date.now() / 1000));
+  resp.status = "completed";
+  resp.model = model || mc.id;
+  resp.output = [];
+  if (outputText || reasoning) {
+    const text = outputText || reasoning;
+    resp.output.push({
+      id: "msg_" + Math.random().toString(36).slice(2, 10),
+      type: "message", status: "completed", role: "assistant",
+      content: [{ type: "output_text", text, annotations: [] }],
+    });
+  }
+  for (const item of toolItems.values()) {
+    resp.output.push({ id: item.id, type: "function_call", status: "completed", call_id: item.callId, name: item.name, arguments: item.args });
+  }
+  resp.usage = chatUsageToResponsesUsage(usage);
+  return resp;
+}
+
+
+// ---------------------------------------------------------------------------
+// Tool
+// ---------------------------------------------------------------------------
+
+// Lightweight cache cleanup: prevent unbounded Map growth over time (Workers have no auto GC)
+function cleanCache() {
+  const now = Date.now();
+  try {
+    if (sessCache.size > 50) {
+      for (const [k, v] of sessCache) {
+        const exp = v.expiresAt ? new Date(v.expiresAt).getTime() : 0;
+        if (exp > 0 && exp < now) sessCache.delete(k);
+      }
+    }
+    if (runCache.size > 50) {
+      for (const [k, v] of runCache) {
+        if (now - v.ts > RUN_CACHE_TTL_MS) runCache.delete(k);
+      }
+    }
+  } catch {}
+}
+
+// /v1/models returns hardcoded MODELS + dynamic official list (merged, deduplicated)
+// ⚠️ Do NOT query upstream GET /api/v1/freebuff/session (quota/status) here:
+// This endpoint would occupy the account session, and Freebuff only allows one client online per account at a time,
+// Querying would disrupt/interfere with an ongoing chat session (428 waiting_room_required).
+async function handleModels() {
+  let modelList = MODELS;
+  try {
+    const dyn = await refreshDynamicModelsIfStale();
+    if (dyn && dyn.models && dyn.models.length) {
+      modelList = mergeModelTables(MODELS, dyn.models);
+    }
+  } catch {}
+  return jsonResponse({
+    object: "list",
+    data: modelList.map((m) => ({ id: m.id, object: "model", created: Math.floor(Date.now() / 1000), owned_by: "freebuff" })),
+  }, 200, { "X-Freebuff2api-Version": VERSION });
+}
+
+function getApiKey(request, env) {
+  const expected = (env.API_KEY || env.FREEBUFF_API_KEY || DEFAULT_API_KEY).trim();
+  if (!expected) return null;
+  const auth = request.headers.get("Authorization") || "";
+  if (auth.startsWith("Bearer ")) return auth.slice(7) === expected ? expected : null;
+  return request.headers.get("x-api-key") === expected ? expected : null;
+}
+
+function jsonResponse(obj, status, extraHeaders = {}) {
+  return new Response(JSON.stringify(obj), { status, headers: { "Content-Type": "application/json", ...corsHeaders(), ...extraHeaders } });
+}
+
+function corsHeaders() {
+  return {
+    "Access-Control-Allow-Origin": "*",
+    "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+    "Access-Control-Allow-Headers": "Content-Type, Authorization, x-api-key, x-freebuff-instance-id, anthropic-version, anthropic-beta",
+  };
+}

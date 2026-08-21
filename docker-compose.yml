@@ -1,0 +1,16 @@
+version: '3.8'
+
+services:
+  freebuff2api:
+    build: .
+    container_name: freebuff2api
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    environment:
+      - PORT=8787
+      - API_KEY=freebuff-default-key
+      - RELAY_URL=https://freebuff-relay-us.irvan-fbe.workers.dev/,https://freebuff-relay-us2.irvan-fbe.workers.dev/
+      - FREEBUFF_DEBUG=false
+    volumes:
+      - ./credentials:/app/credentials
