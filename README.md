@@ -293,14 +293,39 @@ curl http://localhost:8787/v1/chat/completions \
 
 ---
 
-## 8. Daftar Model yang Didukung
+## 8. Daftar Model yang Didukung & Alokasi Kuota
 
-- `deepseek/deepseek-v4-flash` *(Default, sangat cepat, vision support, kuota besar)*
-- `deepseek/deepseek-v4-pro` *(Heavy reasoning)*
-- `openai/gpt-5.6-luna`
-- `minimax/minimax-m3`
-- `crof/kimi-k3-eco`
-- `mimo/mimo-v2.5`
+Freebuff2API mendukung pembagian pool kuota Codebuff upstream:
+
+### 🟢 1. Model Unlimited / High Quota (Standard Pool)
+
+Model di kategori ini memiliki kuota sangat besar / tidak terbatas pada session CLI, sangat cocok untuk penggunaan harian, coding intensif, dan chat rutin:
+
+| Model ID | Fitur Unggulan | Multimodal (Vision) | Kuota per Akun | Rekomendasi Penggunaan |
+|---|---|:---:|---|---|
+| **`deepseek/deepseek-v4-flash`** | Reasoning Cepat, Hemat Kuota, Sangat Cerdas | ✅ **Ya** | **Unlimited** (High Pool) | **Pilihan Utama (Default)** untuk coding & chat |
+| **`mimo/mimo-v2.5`** | Model Ringan & Cepat | ❌ Tidak | **Unlimited** | Task coding cepat & editing ringan |
+
+---
+
+### 🔴 2. Model Premium / Limited (Daily Shared Pool)
+
+Model-model flagship / heavy reasoning berikut dibatasi kuota pembuatan sesi harian (**5 - 6 sesi per hari per akun**, reset otomatis setiap jam **07:00 UTC / 14:00 WIB**). Jika Anda menghubungkan 10 akun, total kuota harian pool Anda menjadi **50 - 60 sesi/hari**:
+
+| Model ID | Fitur Unggulan | Multimodal (Vision) | Kuota per Akun | Rekomendasi Penggunaan |
+|---|---|:---:|---|---|
+| **`deepseek/deepseek-v4-pro`** | DeepSeek V4 Full Heavy Reasoning | ❌ Tidak | 5 - 6 sesi / hari | Arsitektur kompleks & deep problem solving |
+| **`openai/gpt-5.6-luna`** | OpenAI Luna Reasoning Flagship | ❌ Tidak | 5 sesi / hari | Analisis kode sulit & reasoning mendalam |
+| **`minimax/minimax-m3`** | MiniMax M3 High Capability | ❌ Tidak | 5 sesi / hari | Long context & creative writing |
+| **`crof/kimi-k3-eco`** | Kimi K3 Long Context | ❌ Tidak | 5 sesi / hari | Dokumen panjang & codebase luas |
+| **`meta/muse-spark-1.2-contributor`** | Meta Muse Spark Contributor | ❌ Tidak | 5 sesi / hari | Specialized coding & research |
+| **`anthropic/claude-fable-5`** | Claude High-tier Reasoning | ❌ Tidak | Shared pool | Complex multi-step reasoning |
+
+---
+
+### 💡 Tips Efisiensi Penggunaan Kuota:
+1. **Untuk Coding Rutin / Cursor / Cline / 9Router**: Selalu prioritaskan `deepseek/deepseek-v4-flash` karena mendukung text + vision dan tidak akan cepat memakan kuota harian akun.
+2. **Saat Kena Rate Limit (429)**: Server secara cerdas akan langsung memindahkan request ke akun berikutnya di dalam pool credentials tanpa spamming session.
 
 ---
 
