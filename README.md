@@ -55,7 +55,8 @@ Mendukung **3 Mode Deployment**:
 
 ## Opsi 1: Deploy Langsung ke Cloudflare Workers (Wrangler / Serverless)
 
-Mode paling praktis tanpa butuh server/VPS dan tanpa perlu relay terpisah.
+Mode paling praktis tanpa butuh server/VPS dan tanpa perlu relay terpisah.  
+Konfigurasi sudah dilengkapi dengan **`[placement] mode = "smart"`** untuk memastikan eksekusi worker berada di datacenter US guna mencegah error `ip_capped`.
 
 1. Clone repo:
    ```bash
@@ -63,30 +64,14 @@ Mode paling praktis tanpa butuh server/VPS dan tanpa perlu relay terpisah.
    cd freebuff2api
    ```
 
-2. Edit `wrangler.toml`:
-   ```toml
-   name = "freebuff2api"
-   main = "worker.js"
-   compatibility_date = "2024-01-01"
-
-   [vars]
-   API_KEY = "freebuff-default-key"
-   FREEBUFF_DEBUG = "false"
-   RELAY_URL = "" # Biarkan kosong karena worker sudah berada di Cloudflare US Edge!
-   
-   # Isi authToken hasil panen:
-   FREEBUFF_TOKEN = """
-   token_akun_1
-   token_akun_2
-   """
-   ```
-
-3. Deploy ke Cloudflare:
+2. Jalankan one-command deploy otomatis ke US:
    ```bash
-   CLOUDFLARE_API_TOKEN="your-cf-token" npx wrangler deploy
+   # Otomatis sync token & deploy ke Cloudflare US:
+   npm run deploy-us
    ```
+   *(Atau secara manual: edit `wrangler.toml` lalu jalankan `CLOUDFLARE_API_TOKEN="your-token" npx wrangler deploy`)*
 
-4. Endpoint siap digunakan:
+3. Endpoint siap digunakan:
    - Chat: `https://freebuff2api.<your-subdomain>.workers.dev/v1/chat/completions`
    - Cek Status Akun: `https://freebuff2api.<your-subdomain>.workers.dev/v1/accounts`
 

@@ -8,6 +8,7 @@
     "login": "node tools/login_cli.js",
     "sync-wrangler": "node tools/sync_wrangler.js",
     "deploy-wrangler": "node tools/sync_wrangler.js --deploy",
+    "deploy-us": "bash tools/deploy_us.sh",
     "test": "node -e 'console.log(\"OK\")'"
   },
   "keywords": [

@@ -2,6 +2,11 @@ name = "freebuff2api"
 main = "worker.js"
 compatibility_date = "2024-01-01"
 
+# Force Cloudflare to execute Worker in US (North America)
+# This ensures Egress IP is ALWAYS from US datacenter to prevent 'ip_capped'
+[placement]
+mode = "smart"
+
 [vars]
 # API Key untuk autentikasi client
 API_KEY = "freebuff-default-key"
@@ -10,12 +15,7 @@ API_KEY = "freebuff-default-key"
 FREEBUFF_DEBUG = "false"
 
 # Daftarkan token akun Codebuff/Freebuff di sini
-# Format multi-token: pisahkan dengan baris baru (newline) atau koma
-# Bisa otomatis terisi via 'npm run sync-wrangler' atau 'npm run login'
 FREEBUFF_TOKEN = ""
 
-# Note: Jika di-deploy langsung ke Cloudflare Workers (mode Standalone/Direct),
-# request langsung keluar dari edge network Cloudflare (Egress US) ke upstream Codebuff,
-# sehingga TIDAK MEMERLUKAN RELAY EKSTERNAL lagi!
-# Biarkan RELAY_URL kosong:
+# Biarkan kosong jika direct worker di Cloudflare
 RELAY_URL = ""
