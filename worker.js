@@ -1583,8 +1583,12 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
         }
         errText = await resp.text();
         recordAccountObservation(token, resp.status, errText);
-        // 428 waiting_room_required (no active session) / 409 session_superseded (replaced by a new session)
-        // both indicate the cached instance is stale → clear cache, force rebuild, and retry once; not rate limiting, no cooldown
+        // If ip_capped happens (temporary non-US Anycast colo jitter), retry once with alternate routing
+        if (errText.includes("ip_capped") && attempt === 0) {
+          if (debug) console.log(`[acct ${acctTry + 1}][chat] ip_capped detected from colo, retrying request...`);
+          await sleep(800);
+          continue;
+        }
         const staleSession =
           isStaleSessionGate(resp.status, errText) ||
           // Older upstream wrappers returned model mismatch as HTTP 502.
