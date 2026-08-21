@@ -936,22 +936,20 @@ function behaviorDue(key) {
   return false;
 }
 
-// Stable fingerprint: derived from token, always consistent per account (official enhanced- prefix + hash)
-// CF Workers lack synchronous WebCrypto, use lightweight deterministic hash (FNV-1a dual seed + hex)
+// Stable fingerprint: derived from token, always consistent per account (official codebuff-cli- prefix)
 function stableFingerprint(token) {
   let h1 = 0x811c9dc5, h2 = 0x01000193;
-  const s = "freebuff-fp-v2:" + token;
+  const s = "codebuff-fp-v3:" + token;
   for (let i = 0; i < s.length; i++) {
     const c = s.charCodeAt(i);
     h1 = Math.imul(h1 ^ c, 0x01000193) >>> 0;
     h2 = Math.imul(h2 ^ c, 0x85ebca6b) >>> 0;
   }
-  return "enhanced-" + h1.toString(16).padStart(8, "0") + h2.toString(16).padStart(8, "0");
+  return "codebuff-cli-" + (h1 ^ h2).toString(16).padStart(8, "0");
 }
 
 // Ad chain: POST /ads to fetch → if impUrl exists, POST /ads/impression for impression reporting.
-// Official implementation: getCliAdRequestUserAgent sends Freebuff-CLI/<version> UA;
-// body {provider:"gravity", surface, sessionId, device, userAgent}; impression {impUrl, mode}
+// Matches official codebuff-cli device metadata & timezone
 async function runNormalClientBehavior(token, clientFingerprint) {
   const failures = [];
   // 1) Ad fetch + impression (every 30 min, avoid hitting ad API per request)
@@ -961,14 +959,14 @@ async function runNormalClientBehavior(token, clientFingerprint) {
         provider: "gravity",
         sessionId: crypto.randomUUID(),
         surface: "waiting_room",
-        device: { os: "macos", timezone: "Asia/Shanghai", locale: "zh-CN" },
-        userAgent: "Freebuff-CLI/0.0.138",
-      }, { "User-Agent": "Freebuff-CLI/0.0.138", "Content-Type": "application/json" }, 6000);
+        device: { os: "linux", timezone: "America/Los_Angeles", locale: "en-US" },
+        userAgent: "codebuff-cli/1.0.685",
+      }, { "User-Agent": "codebuff-cli/1.0.685", "Content-Type": "application/json" }, 6000);
       const impUrl = ad.data && Array.isArray(ad.data.ads) && ad.data.ads[0] && ad.data.ads[0].impUrl;
       if (ad.status === 200 && impUrl) {
         await enqueueUp("POST", "/api/v1/ads/impression", token,
           { impUrl, mode: "free" },
-          { "User-Agent": "Freebuff-CLI/0.0.138", "Content-Type": "application/json" }, 6000);
+          { "User-Agent": "codebuff-cli/1.0.685", "Content-Type": "application/json" }, 6000);
       }
     } catch (e) { failures.push("ads:" + String(e && e.message || e).slice(0, 80)); }
   }
@@ -977,7 +975,7 @@ async function runNormalClientBehavior(token, clientFingerprint) {
     try {
       await enqueueUp("POST", "/api/v1/usage", token,
         { fingerprintId: clientFingerprint },
-        { "Content-Type": "application/json" }, 6000);
+        { "Content-Type": "application/json", "User-Agent": "codebuff-cli/1.0.685" }, 6000);
     } catch (e) { failures.push("usage:" + String(e && e.message || e).slice(0, 80)); }
   }
   return failures;
