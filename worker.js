@@ -777,7 +777,7 @@ function applyMimicHeaders(headers) {
   if (!h.has("x-freebuff-client-type")) h.set("x-freebuff-client-type", "cli");
   if (!h.has("x-freebuff-ide-type")) h.set("x-freebuff-ide-type", "cli");
   if (!h.has("User-Agent")) {
-    h.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
+    h.set("User-Agent", "codebuff-cli/1.0.685");
   }
   if (!h.has("Accept")) h.set("Accept", "application/json, text/plain, */*");
   if (!h.has("Accept-Language")) h.set("Accept-Language", "en-US,en;q=0.9");

@@ -41,7 +41,7 @@ var worker_default = {
     // Spoof browser user-agent & CLI signatures
     const ua = (newRequestInit.headers.get("user-agent") || "").toLowerCase();
     if (!ua || ua.includes("python") || ua.includes("curl") || ua.includes("node-fetch") || ua.includes("go-http") || ua.includes("cloudflare")) {
-      newRequestInit.headers.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
+      newRequestInit.headers.set("User-Agent", "codebuff-cli/1.0.685");
     }
 
     if (target.includes("codebuff.com") || target.includes("freebuff.com")) {
