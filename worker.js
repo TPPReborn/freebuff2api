@@ -1583,11 +1583,12 @@ async function executeChat(env, chatParams, mc, isStream, mode) {
         }
         errText = await resp.text();
         recordAccountObservation(token, resp.status, errText);
-        // If ip_capped happens (temporary non-US Anycast colo jitter), retry once with alternate routing
-        if (errText.includes("ip_capped") && attempt === 0) {
-          if (debug) console.log(`[acct ${acctTry + 1}][chat] ip_capped detected from colo, retrying request...`);
-          await sleep(800);
-          continue;
+        // 429 Rate Limit / Spend Limit Guard: IMMEDIATELY cooldown and break without retrying
+        if (resp.status === 429 || errText.includes("spend_limited") || errText.includes("rate_limited")) {
+          const cdMs = parseCooldown(errText, 429, resp.headers);
+          cooldown(token, cdMs);
+          if (debug) console.log(`[acct ${acctTry + 1}][chat] 429 rate limit hit, cooldown ${(cdMs/1000/60).toFixed(1)}m. Switching account immediately...`);
+          break;
         }
         const staleSession =
           isStaleSessionGate(resp.status, errText) ||
