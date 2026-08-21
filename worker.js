@@ -767,28 +767,44 @@ function getRelayUrl() {
   return selected;
 }
 
+// Standard Codebuff CLI / Desktop mimic headers (Anti-Detection)
+function applyMimicHeaders(headers) {
+  const h = headers instanceof Headers ? headers : new Headers(headers);
+  if (!h.has("x-freebuff-sdk-version")) h.set("x-freebuff-sdk-version", "0.0.141");
+  if (!h.has("x-freebuff-client-type")) h.set("x-freebuff-client-type", "cli");
+  if (!h.has("x-freebuff-ide-type")) h.set("x-freebuff-ide-type", "cli");
+  if (!h.has("User-Agent")) {
+    h.set("User-Agent", "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36");
+  }
+  if (!h.has("Accept")) h.set("Accept", "application/json, text/plain, */*");
+  if (!h.has("Accept-Language")) h.set("Accept-Language", "en-US,en;q=0.9");
+  return headers instanceof Headers ? h : Object.fromEntries(h.entries());
+}
+
 // Resolve upstream URL: if RELAY_URL is set, route through relay (inject relay headers)
 function resolveUpstream(path, extraHeaders = {}) {
   const currentRelay = getRelayUrl();
+  const baseHeaders = applyMimicHeaders(extraHeaders);
   if (currentRelay) {
-    const relayHeaders = { ...extraHeaders };
+    const relayHeaders = { ...baseHeaders };
     relayHeaders["x-relay-target"] = CODEBUFF_API;
     relayHeaders["x-relay-path"] = path;
     return [currentRelay, relayHeaders];
   }
-  return [CODEBUFF_API + path, extraHeaders];
+  return [CODEBUFF_API + path, baseHeaders];
 }
 
 // Resolve direct chat fetch URL (for streaming, which bypasses up())
 function resolveChatUrl(path, headers) {
   const currentRelay = getRelayUrl();
+  const h = new Headers(headers);
+  applyMimicHeaders(h);
   if (currentRelay) {
-    const h = new Headers(headers);
     h.set("x-relay-target", CODEBUFF_API);
     h.set("x-relay-path", path);
     return [currentRelay, h];
   }
-  return [CODEBUFF_API + path, headers];
+  return [CODEBUFF_API + path, h];
 }
 
 async function up(method, path, token, body, extraHeaders = {}, timeoutMs = UPSTREAM_TIMEOUT_MS) {
