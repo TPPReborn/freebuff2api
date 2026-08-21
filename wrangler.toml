@@ -2,10 +2,11 @@ name = "freebuff2api"
 main = "worker.js"
 compatibility_date = "2024-01-01"
 
-# Force Cloudflare to execute Worker in US (North America)
-# This ensures Egress IP is ALWAYS from US datacenter to prevent 'ip_capped'
+# Targeted Placement to AWS US-East (US Region)
+# Mengunci eksekusi worker 100% di US Datacenter (Anti ip_capped)
 [placement]
-mode = "smart"
+mode = "targeted"
+region = "aws:us-east-1"
 
 [vars]
 # API Key untuk autentikasi client
@@ -14,7 +15,7 @@ API_KEY = "freebuff-default-key"
 # Mode Debug (true / false)
 FREEBUFF_DEBUG = "false"
 
-# Daftarkan token akun Codebuff/Freebuff di sini
+# Daftarkan token akun Codebuff/Freebuff di sini (bisa multi-token dipisah newline)
 FREEBUFF_TOKEN = ""
 
 # Biarkan kosong jika direct worker di Cloudflare

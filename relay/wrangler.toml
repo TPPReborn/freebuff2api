@@ -2,6 +2,7 @@ name = "freebuff-relay-us"
 main = "worker.js"
 compatibility_date = "2024-01-01"
 
-# Force US Egress
+# Targeted Placement to US Region
 [placement]
-mode = "smart"
+mode = "targeted"
+region = "aws:us-east-1"
