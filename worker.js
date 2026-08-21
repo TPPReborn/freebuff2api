@@ -410,6 +410,9 @@ export default {
     if (request.method === "GET" && (url.pathname === "/v1/models" || url.pathname === "/models")) {
       return await handleModels();
     }
+    if (request.method === "GET" && (url.pathname === "/v1/accounts" || url.pathname === "/accounts" || url.pathname === "/v1/health" || url.pathname === "/health")) {
+      return await handleAccountStatus(env);
+    }
     if (request.method === "POST" && (url.pathname === "/v1/chat/completions" || url.pathname === "/chat/completions")) {
       return handleChat(request, env);
     }
@@ -2209,6 +2212,68 @@ function cleanCache() {
       }
     }
   } catch {}
+}
+
+async function handleAccountStatus(env) {
+  const pool = parseAccounts(env);
+  if (pool.length === 0) {
+    return jsonResponse({ error: "No accounts configured in FREEBUFF_TOKEN", accounts: [] }, 200);
+  }
+
+  const results = [];
+  for (let i = 0; i < pool.length; i++) {
+    const acct = pool[i];
+    const token = acct.token;
+    const masked = token.slice(0, 8) + "..." + token.slice(-4);
+    const cd = cooldowns.get(token) || 0;
+    const isCooldown = cd > Date.now();
+    const cdRemainingSec = isCooldown ? Math.round((cd - Date.now()) / 1000) : 0;
+
+    let tier = "unknown";
+    let status = "unknown";
+    let poolLabel = "";
+    let rateLimit = null;
+
+    try {
+      const [fetchUrl, fetchHeaders] = resolveUpstream("/api/v1/freebuff/session", {
+        Authorization: "Bearer " + token,
+        "x-freebuff-include-unused-rate-limits": "true"
+      });
+      const r = await fetch(fetchUrl, { headers: fetchHeaders });
+      if (r.ok) {
+        const data = await r.json();
+        tier = data.accessTier || data.tier || "standard";
+        status = data.status || "ready";
+        rateLimit = data.rateLimit || null;
+        poolLabel = rateLimit?.poolLabel || "";
+      } else {
+        status = `http_${r.status}`;
+      }
+    } catch (e) {
+      status = "network_error: " + (e.message || e);
+    }
+
+    results.push({
+      slot: `${i + 1}/${pool.length}`,
+      token: masked,
+      accessTier: tier,
+      status: status,
+      pool: poolLabel,
+      rateLimit: rateLimit,
+      inCooldown: isCooldown,
+      cooldownRemainingSeconds: cdRemainingSec
+    });
+  }
+
+  const fullCount = results.filter(a => a.accessTier === "full").length;
+  return jsonResponse({
+    summary: {
+      total_accounts: pool.length,
+      full_tier_accounts: fullCount,
+      active_rate_limited: results.filter(a => a.inCooldown).length
+    },
+    accounts: results
+  }, 200, { "X-Freebuff2api-Version": VERSION });
 }
 
 // /v1/models returns hardcoded MODELS + dynamic official list (merged, deduplicated)
